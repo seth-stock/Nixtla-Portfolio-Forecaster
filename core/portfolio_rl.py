@@ -1,76 +1,52 @@
 """
 portfolio_rl.py
-Portfolio optimization utilities combining Nixtla forecasts with a simple
-policy-gradient reinforcement learning agent implemented in PyTorch.
-Torch is imported lazily to avoid failing at module import time if the
-environment has an incompatible PyTorch install.
+Portfolio optimization helpers combining forecasting with a lightweight
+policy-gradient allocator and a deterministic mean-variance baseline.
 """
 
 from __future__ import annotations
 
-import logging
-import sys
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-_TORCH_IMPORT_ERROR: Optional[Exception] = None
+
+from core import data_loading, evaluation, models_mlforecast, models_statsforecast
+
 _TORCH_CACHE: Dict[str, Any] = {}
-_SF_CACHE: Dict[str, Any] = {}
 
 
 def _lazy_torch() -> Dict[str, Any]:
-    """
-    Import torch/nn/optim on-demand with a clear error if unavailable.
-    Keep imports minimal to avoid circular import issues seen in some environments.
-    """
-    global _TORCH_IMPORT_ERROR
+    """Import torch lazily so the rest of the app remains importable without it."""
     if _TORCH_CACHE:
         return _TORCH_CACHE
     try:
         import torch  # type: ignore
         import torch.nn as nn  # type: ignore
         import torch.optim as optim  # type: ignore
-    except Exception as e:  # pragma: no cover - informative fallback
-        _TORCH_IMPORT_ERROR = e
+    except Exception as e:
         raise ImportError(
-            "PyTorch is required for the RL optimizer. Install GPU-enabled torch 2.9 "
-            f"(original import error: {e})"
-        )
-
-    # Prefer CUDA for acceleration if available.
-    device = "cuda" if getattr(torch, "cuda", None) and torch.cuda.is_available() else "cpu"
-    try:
-        torch.set_default_device(device)
-    except Exception:
-        pass
-    try:
-        torch.set_num_threads(16)
-    except Exception:
-        pass
-    _TORCH_CACHE.update({"torch": torch, "nn": nn, "optim": optim, "device": device})
+            "PyTorch is required for RL training/inference. Install a CPU or CUDA-compatible "
+            f"torch build. Original import error: {e}"
+        ) from e
+    _TORCH_CACHE.update({"torch": torch, "nn": nn, "optim": optim})
     return _TORCH_CACHE
 
 
-def _lazy_statsforecast() -> Dict[str, Any]:
-    """Import StatsForecast models on demand with clearer errors (pyarrow on Windows)."""
-    if _SF_CACHE:
-        return _SF_CACHE
-    try:
-        from statsforecast import StatsForecast  # type: ignore
-        from statsforecast.models import AutoARIMA, AutoETS, SeasonalNaive  # type: ignore
-    except Exception as e:
-        raise ImportError(
-            "StatsForecast (and its dependencies like pyarrow) is required. "
-            "Install with `pip install statsforecast pyarrow fugue`."
-        ) from e
-    _SF_CACHE.update(
-        {"StatsForecast": StatsForecast, "AutoARIMA": AutoARIMA, "AutoETS": AutoETS, "SeasonalNaive": SeasonalNaive}
-    )
-    return _SF_CACHE
+def _resolve_device(requested: Optional[str] = None, cpu_threads: Optional[int] = None) -> str:
+    torch_mod = _lazy_torch()
+    torch = torch_mod["torch"]
+    requested = str(requested or "cpu").lower()
+    if requested == "cuda" and getattr(torch, "cuda", None) and torch.cuda.is_available():
+        return "cuda"
+    if cpu_threads:
+        try:
+            torch.set_num_threads(max(1, int(cpu_threads)))
+        except Exception:
+            pass
+    return "cpu"
 
 
 def format_price_frame(
@@ -79,42 +55,42 @@ def format_price_frame(
     price_col: str = "close",
     ticker_col: str = "ticker",
 ) -> pd.DataFrame:
-    """Validate and standardize a price dataframe provided by the user."""
+    """Validate and standardize a user-provided price dataframe."""
     required = {date_col, price_col, ticker_col}
     if not required.issubset(df.columns):
         raise ValueError(f"Price data must include columns: {required}")
     formatted = df[[date_col, ticker_col, price_col]].copy()
     formatted = formatted.rename(columns={date_col: "ds", ticker_col: "ticker", price_col: "close"})
-    formatted["ds"] = pd.to_datetime(formatted["ds"], errors="coerce")
+    formatted["ds"] = pd.to_datetime(formatted["ds"], errors="coerce").dt.tz_localize(None)
+    formatted["close"] = pd.to_numeric(formatted["close"], errors="coerce")
+    formatted["ticker"] = formatted["ticker"].astype(str)
     formatted = formatted.dropna(subset=["ds", "close", "ticker"])
-    formatted = formatted.sort_values(["ticker", "ds"]).reset_index(drop=True)
-    return formatted
+    return formatted.sort_values(["ticker", "ds"]).reset_index(drop=True)
 
 
 def clean_price_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """Basic cleaning: drop infs, remove duplicates, forward-fill missing close."""
-    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["close"])
-    df = df.drop_duplicates(subset=["ticker", "ds"])
-    df["close"] = df.groupby("ticker")["close"].ffill()
-    df = df.dropna(subset=["close"])
-    return df
+    """Basic cleaning for price data."""
+    cleaned = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["close"]).copy()
+    cleaned = cleaned.drop_duplicates(subset=["ticker", "ds"])
+    cleaned["close"] = cleaned.groupby("ticker")["close"].ffill().bfill()
+    cleaned = cleaned[cleaned["close"] > 0]
+    return cleaned.dropna(subset=["close"]).reset_index(drop=True)
 
 
 def resample_prices(prices: pd.DataFrame, rule: str) -> pd.DataFrame:
-    """
-    Resample price data to a new frequency rule (e.g., '10min','1H','1D','M','Q').
-    Uses last close in each period.
-    """
+    """Resample prices to a common cadence using the last close in each bucket."""
     prices = prices.copy()
     prices["ds"] = pd.to_datetime(prices["ds"])
     frames = []
     for ticker, grp in prices.groupby("ticker"):
         grp = grp.set_index("ds").sort_index()
         res = grp["close"].resample(rule).last().dropna()
+        if res.empty:
+            continue
         frames.append(pd.DataFrame({"ds": res.index, "ticker": ticker, "close": res.values}))
-    if frames:
-        return pd.concat(frames, ignore_index=True).sort_values(["ticker", "ds"])
-    return prices
+    if not frames:
+        return prices
+    return pd.concat(frames, ignore_index=True).sort_values(["ticker", "ds"]).reset_index(drop=True)
 
 
 def load_prices_from_files(
@@ -123,10 +99,7 @@ def load_prices_from_files(
     price_col: str = "Close",
     ticker_col: Optional[str] = None,
 ) -> pd.DataFrame:
-    """
-    Combine multiple CSV files (one per ticker) into a single standardized dataframe.
-    If ticker_col is None, infer ticker names from filenames.
-    """
+    """Load multiple CSVs into a single long price dataframe."""
     frames = []
     for idx, file in enumerate(files):
         name = getattr(file, "name", None)
@@ -134,19 +107,15 @@ def load_prices_from_files(
             name = Path(file).name
         ticker_name = Path(name).stem.upper() if name else f"TICKER_{idx}"
         df = pd.read_csv(file)
-        if ticker_col is None or ticker_col not in df.columns:
+        use_ticker_col = ticker_col
+        if use_ticker_col is None or use_ticker_col not in df.columns:
             df = df.copy()
             df["__ticker"] = ticker_name
             use_ticker_col = "__ticker"
-        else:
-            use_ticker_col = ticker_col
-        formatted = format_price_frame(df, date_col=date_col, price_col=price_col, ticker_col=use_ticker_col)
-        frames.append(formatted)
+        frames.append(format_price_frame(df, date_col=date_col, price_col=price_col, ticker_col=use_ticker_col))
     if not frames:
         raise ValueError("No CSV files provided for price loading.")
-    combined = pd.concat(frames, ignore_index=True)
-    combined = combined.sort_values(["ticker", "ds"]).reset_index(drop=True)
-    return combined
+    return pd.concat(frames, ignore_index=True).sort_values(["ticker", "ds"]).reset_index(drop=True)
 
 
 def load_prices_from_directory(
@@ -167,11 +136,120 @@ def load_prices_from_directory(
 
 
 def prepare_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    """Compute percentage returns per ticker."""
-    prices = prices.sort_values(["ticker", "ds"])
-    prices["y"] = prices.groupby("ticker")["close"].pct_change().fillna(0.0)
+    """Compute arithmetic returns per ticker."""
+    prices = prices.sort_values(["ticker", "ds"]).copy()
+    prices["y"] = prices.groupby("ticker")["close"].pct_change()
+    prices["y"] = prices["y"].replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=-0.95)
     returns = prices.rename(columns={"ticker": "unique_id"})
     return returns[["unique_id", "ds", "y"]]
+
+
+def infer_freq_from_prices(prices: pd.DataFrame) -> str:
+    """Infer a consensus frequency from the available price history."""
+    temp = prices.rename(columns={"ticker": "unique_id"})
+    return data_loading.infer_frequency_per_series(temp[["unique_id", "ds", "close"]], "ds") or "B"
+
+
+def _split_validation_frame(returns_df: pd.DataFrame, horizon: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    trains = []
+    vals = []
+    for _, g in returns_df.groupby("unique_id"):
+        g = g.sort_values("ds").reset_index(drop=True)
+        if len(g) < max(horizon * 4, 40):
+            continue
+        trains.append(g.iloc[:-horizon].copy())
+        vals.append(g.iloc[-horizon:].copy())
+    if not trains or not vals:
+        raise ValueError("Not enough history to create a validation split for the optimizer forecasts.")
+    return pd.concat(trains, ignore_index=True), pd.concat(vals, ignore_index=True)
+
+
+def _align_forecasts_to_actuals(actual_df: pd.DataFrame, forecast_df: pd.DataFrame) -> pd.DataFrame:
+    actual_eval = actual_df.rename(columns={"y": "actual"})
+    merged = forecast_df.merge(actual_eval[["unique_id", "ds", "actual"]], on=["unique_id", "ds"], how="left")
+    return merged.dropna(subset=["forecast", "actual"])
+
+
+def _build_candidate_forecasts(
+    train_df: pd.DataFrame,
+    horizon: int,
+    freq: str,
+    forecast_params: dict,
+    cpu_threads: int,
+) -> List[pd.DataFrame]:
+    candidates = []
+    try:
+        stats_models = ["AutoARIMA", "AutoETS", "SeasonalNaive"]
+        stats_fc = models_statsforecast.fit_and_forecast(
+            train_df,
+            "ds",
+            "y",
+            horizon,
+            freq,
+            stats_models,
+            model_params=forecast_params.get("stats"),
+            n_jobs=cpu_threads,
+        )
+        candidates.append(stats_fc)
+    except Exception:
+        pass
+    try:
+        rf_params = forecast_params.get("ml", {}).get("rf_params", {"n_estimators": 300, "max_depth": 8})
+        ml_fc = models_mlforecast.fit_and_forecast(
+            train_df,
+            "ds",
+            "y",
+            horizon,
+            freq,
+            rf_params=rf_params,
+            n_jobs=cpu_threads,
+            use_diff=False,
+            forecast_mode="multi-output (direct)",
+        )
+        candidates.append(ml_fc)
+    except Exception:
+        pass
+    mean_rows = []
+    for uid, g in train_df.groupby("unique_id"):
+        g = g.sort_values("ds")
+        avg_ret = float(g["y"].tail(min(20, len(g))).mean())
+        future_ds = pd.date_range(start=g["ds"].max(), periods=horizon + 1, freq=freq)[1:]
+        mean_rows.append(
+            pd.DataFrame(
+                {
+                    "ds": future_ds,
+                    "unique_id": uid,
+                    "model": "HistoricalMean",
+                    "forecast": avg_ret,
+                }
+            )
+        )
+    if mean_rows:
+        candidates.append(pd.concat(mean_rows, ignore_index=True))
+    return [c for c in candidates if not c.empty]
+
+
+def _compute_validation_scores(val_df: pd.DataFrame, candidate_forecasts: List[pd.DataFrame]) -> pd.DataFrame:
+    records = []
+    for fc in candidate_forecasts:
+        merged = _align_forecasts_to_actuals(val_df, fc)
+        if merged.empty:
+            continue
+        for (uid, model), grp in merged.groupby(["unique_id", "model"]):
+            metrics = evaluation.compute_metrics(grp["actual"], grp["forecast"])
+            records.append(
+                {
+                    "unique_id": uid,
+                    "model": model,
+                    "validation_rmse": metrics["RMSE"],
+                    "validation_mae": metrics["MAE"],
+                    "validation_smape": metrics["sMAPE"],
+                }
+            )
+    scores = pd.DataFrame(records)
+    if scores.empty:
+        raise ValueError("Optimizer forecast candidates could not be aligned to the validation window.")
+    return scores.sort_values(["unique_id", "validation_rmse"])
 
 
 def forecast_asset_returns(
@@ -180,318 +258,132 @@ def forecast_asset_returns(
     freq: str,
     device: Optional[str] = None,
     forecast_params: Optional[Dict[str, Any]] = None,
+    cpu_threads: int = 8,
 ) -> pd.DataFrame:
     """
-    Use StatsForecast (AutoARIMA, AutoETS), PyCaret compare_models, NeuralProphet, and LSTM
-    to forecast returns per asset.
-    Train/val/test split per asset (with purge/embargo), RMSE-based model selection.
-    Returns dataframe with expected return per asset and the winning model name.
+    Forecast next-horizon asset returns using lightweight Nixtla models and
+    select the winning model per asset via a rolling validation holdout.
     """
-    try:
-        sf_mod = _lazy_statsforecast()
-    except Exception as e:
-        raise RuntimeError(
-            "StatsForecast/pyarrow are required to forecast asset returns. Install with "
-            "`pip install statsforecast pyarrow fugue`. Original error: {}".format(e)
-        ) from e
-    StatsForecast = sf_mod["StatsForecast"]
-    AutoARIMA = sf_mod["AutoARIMA"]
-    AutoETS = sf_mod["AutoETS"]
-    SeasonalNaive = sf_mod["SeasonalNaive"]
-    def _lazy_neuralprophet():
-        try:
-            from neuralprophet import NeuralProphet  # type: ignore
-            return NeuralProphet
-        except Exception as e:
-            raise ImportError("neuralprophet is required; install neuralprophet to enable.") from e
-
-    def _lazy_s5():
-        try:
-            from s5_pytorch import S5Layer  # type: ignore
-            return S5Layer
-        except Exception as e:
-            raise ImportError("s5-pytorch is required; install s5-pytorch to enable.") from e
-
+    del device
     forecast_params = forecast_params or {}
-    torch_mod = _lazy_torch()
-    torch = torch_mod["torch"]
-    nn = torch_mod["nn"]
-    optim = torch_mod["optim"]
-    # Prefer provided device; otherwise use cached default (CUDA if available).
-    torch_device = torch_mod.get("device", "cpu")
-    device = device or ("cuda" if torch_device == "cuda" and torch.cuda.is_available() else torch_device)
+    train_df, val_df = _split_validation_frame(returns_df, horizon)
+    candidate_forecasts = _build_candidate_forecasts(train_df, horizon, freq, forecast_params, cpu_threads)
+    scores = _compute_validation_scores(val_df, candidate_forecasts)
+    best_models = scores.groupby("unique_id", as_index=False).first()
 
-    freq = freq or "D"
-    results = []
-    purge = max(1, horizon // 2)
-    embargo = max(1, horizon // 4)
-    lstm_hidden = int(forecast_params.get("lstm_hidden", 64))
-    lstm_layers = int(forecast_params.get("lstm_layers", 6))
-    lstm_proj = int(forecast_params.get("lstm_proj", 32))
-    lstm_seq_len = int(forecast_params.get("lstm_seq_len", 30))
-    lstm_epochs = int(forecast_params.get("lstm_epochs", 25))
-    lstm_lr = float(forecast_params.get("lstm_lr", 1e-5))
-
-    def _strip_tz(series: pd.Series) -> pd.Series:
-        """Ensure datetime series is tz-naive to avoid merge/type issues."""
-        return pd.to_datetime(series).dt.tz_localize(None)
-
-    class LSTMForecaster(nn.Module):
-        def __init__(self, input_dim: int, horizon: int):
-            super().__init__()
-            self.lstm = nn.LSTM(input_dim, lstm_hidden, num_layers=lstm_layers, batch_first=True)
-            self.proj = nn.Sequential(
-                nn.Linear(lstm_hidden, lstm_proj),
-                nn.ReLU(),
-                nn.Linear(lstm_proj, horizon),
-            )
-
-        def forward(self, x):
-            out, _ = self.lstm(x)
-            last = out[:, -1, :]
-            return self.proj(last)
-
-    for uid, group in returns_df.groupby("unique_id"):
-        g = group.sort_values("ds").reset_index(drop=True)
-        if len(g) <= horizon * 3:
+    full_candidates = pd.concat(
+        _build_candidate_forecasts(returns_df, horizon, freq, forecast_params, cpu_threads),
+        ignore_index=True,
+    )
+    rows = []
+    for row in best_models.itertuples(index=False):
+        selected = full_candidates[
+            (full_candidates["unique_id"] == row.unique_id) & (full_candidates["model"] == row.model)
+        ].sort_values("ds")
+        if selected.empty:
             continue
-        test = g.iloc[-horizon:]
-        val = g.iloc[-(2 * horizon + embargo): -horizon]
-        train = g.iloc[: -(2 * horizon + embargo + purge)]
-        if len(train) <= horizon or len(val) < 1:
-            continue
-
-        # StatsForecast models
-        sf_df = train.rename(columns={"ds": "ds", "y": "y"}).assign(unique_id=uid)
-        sf = StatsForecast(
-            models=[AutoARIMA(season_length=1), AutoETS(season_length=1)],
-            freq=freq,
-            n_jobs=16,
-            fallback_model=SeasonalNaive(season_length=1),
+        path = selected["forecast"].astype(float).head(horizon).to_numpy()
+        path = np.nan_to_num(path, nan=0.0, posinf=0.0, neginf=0.0)
+        path = np.clip(path, -0.95, None)
+        rows.append(
+            {
+                "unique_id": row.unique_id,
+                "model": row.model,
+                "validation_rmse": float(row.validation_rmse),
+                "validation_mae": float(row.validation_mae),
+                "validation_smape": float(row.validation_smape),
+                "mean_forecast_return": float(path.mean()),
+                "expected_return": float(np.prod(1.0 + path) - 1.0),
+                "forecast_volatility": float(path.std(ddof=0)),
+                "forecast_path": path.tolist(),
+            }
         )
-        sf.fit(sf_df)
-        sf_fcst_val = sf.forecast(df=sf_df, h=len(val)).reset_index()
-        sf_fcst_val = sf_fcst_val.melt(id_vars=["ds", "unique_id"], var_name="model", value_name="forecast")
-        sf_fcst_val["ds"] = _strip_tz(sf_fcst_val["ds"])
-        sf_fcst = sf.forecast(df=pd.concat([sf_df, val.rename(columns={"ds": "ds", "y": "y"}).assign(unique_id=uid)]), h=horizon).reset_index()
-        sf_fcst = sf_fcst.melt(id_vars=["ds", "unique_id"], var_name="model", value_name="forecast")
-        sf_fcst["ds"] = _strip_tz(sf_fcst["ds"])
-
-        # LSTM model (simple supervised sequence forecast)
-        series = train["y"].astype(float).values
-        seq_len = lstm_seq_len
-        X, y_target = [], []
-        for i in range(len(series) - seq_len - horizon + 1):
-            X.append(series[i : i + seq_len])
-            y_target.append(series[i + seq_len : i + seq_len + horizon])
-        X = torch.tensor(np.array(X), dtype=torch.float32).unsqueeze(-1).to(device)
-        y_target = torch.tensor(np.array(y_target), dtype=torch.float32).to(device)
-        lstm_model = LSTMForecaster(input_dim=1, horizon=horizon).to(device)
-        optimizer = optim.Adam(lstm_model.parameters(), lr=lstm_lr)
-        loss_fn = nn.MSELoss()
-        epochs = lstm_epochs
-        best_loss = float("inf")
-        patience = int(forecast_params.get("lstm_patience", 5))
-        patience_ctr = 0
-        for _ in range(epochs):
-            optimizer.zero_grad()
-            pred = lstm_model(X)
-            loss = loss_fn(pred, y_target)
-            loss.backward()
-            optimizer.step()
-            curr = float(loss.detach().cpu())
-            if curr + 1e-6 < best_loss:
-                best_loss = curr
-                patience_ctr = 0
-            else:
-                patience_ctr += 1
-                if patience_ctr >= patience:
-                    break
-        with torch.no_grad():
-            last_seq = torch.tensor(series[-seq_len:], dtype=torch.float32).unsqueeze(0).unsqueeze(-1).to(device)
-            lstm_pred = lstm_model(last_seq).detach().cpu().numpy().flatten()
-        val_series = g["y"].astype(float).values[: -(horizon + embargo)]
-        val_len = len(val)
-        if len(val_series) >= seq_len:
-            with torch.no_grad():
-                val_last_seq = torch.tensor(val_series[-seq_len:], dtype=torch.float32).unsqueeze(0).unsqueeze(-1).to(device)
-                raw_val_pred = lstm_model(val_last_seq).detach().cpu().numpy().flatten()
-                # Ensure the validation forecast length matches the validation window
-                if len(raw_val_pred) < val_len:
-                    val_pred = np.resize(raw_val_pred, val_len)
-                else:
-                    val_pred = raw_val_pred[:val_len]
-        else:
-            val_pred = np.full(val_len, np.nan)
-        lstm_df = pd.DataFrame({
-            "ds": pd.date_range(start=test["ds"].min(), periods=horizon, freq=freq),
-            "unique_id": uid,
-            "model": "LSTM",
-            "forecast": lstm_pred,
-        })
-        lstm_df["ds"] = _strip_tz(lstm_df["ds"])
-        lstm_val_df = pd.DataFrame({
-            "ds": val["ds"].values,
-            "unique_id": uid,
-            "model": "LSTM",
-            "forecast": val_pred,
-        })
-        lstm_val_df["ds"] = _strip_tz(lstm_val_df["ds"])
-
-        # NeuralProphet (optional)
-        np_ok = True
-        try:
-            NeuralProphet = _lazy_neuralprophet()
-            np_model = NeuralProphet(n_forecasts=1, n_lags=0)
-            np_model.fit(train.rename(columns={"ds": "ds", "y": "y"}), freq=freq)
-            np_val_fc = np_model.make_future_dataframe(train.rename(columns={"ds": "ds", "y": "y"}), periods=len(val))
-            np_val_pred = np_model.predict(np_val_fc)
-            np_val_df = pd.DataFrame({
-                "ds": np_val_pred["ds"].values[-len(val):],
-                "unique_id": uid,
-                "model": "NeuralProphet",
-                "forecast": np_val_pred[[c for c in np_val_pred.columns if c.startswith("yhat")]].mean(axis=1).values[-len(val):],
-            })
-            np_val_df["ds"] = _strip_tz(np_val_df["ds"])
-            np_test_fc = np_model.make_future_dataframe(train.rename(columns={"ds": "ds", "y": "y"}), periods=horizon)
-            np_test_pred = np_model.predict(np_test_fc)
-            np_test_df = pd.DataFrame({
-                "ds": np_test_pred["ds"].values[-horizon:],
-                "unique_id": uid,
-                "model": "NeuralProphet",
-                "forecast": np_test_pred[[c for c in np_test_pred.columns if c.startswith("yhat")]].mean(axis=1).values[-horizon:],
-            })
-            np_test_df["ds"] = _strip_tz(np_test_df["ds"])
-        except Exception:
-            np_ok = False
-            np_val_df = pd.DataFrame(columns=["ds", "unique_id", "model", "forecast"])
-            np_test_df = pd.DataFrame(columns=["ds", "unique_id", "model", "forecast"])
-
-        # S5 (optional)
-        s5_ok = False
-        try:
-            S5Layer = _lazy_s5()
-            class S5Wrapper(nn.Module):
-                def __init__(self, input_dim: int, horizon: int, seq_len: int):
-                    super().__init__()
-                    self.s5 = S5Layer(d_model=32, l_max=seq_len)
-                    self.proj = nn.Linear(32, horizon)
-
-                def forward(self, x):
-                    # x shape: (batch, seq_len, 1)
-                    # expand to d_model
-                    x = x.repeat(1, 1, 32)
-                    out = self.s5(x)[0][:, -1, :]
-                    return self.proj(out)
-
-            X_s, y_s = [], []
-            for i in range(len(series) - seq_len - horizon + 1):
-                X_s.append(series[i : i + seq_len])
-                y_s.append(series[i + seq_len : i + seq_len + horizon])
-            X_s = torch.tensor(np.array(X_s), dtype=torch.float32).unsqueeze(-1).to(device)
-            y_s = torch.tensor(np.array(y_s), dtype=torch.float32).to(device)
-            s5_model = S5Wrapper(input_dim=16, horizon=horizon, seq_len=seq_len).to(device)
-            opt_s = optim.Adam(s5_model.parameters(), lr=1e-5)
-            loss_fn_s = nn.MSELoss()
-            for _ in range(10):
-                opt_s.zero_grad()
-                pred = s5_model(X_s)
-                loss_s = loss_fn_s(pred, y_s)
-                loss_s.backward()
-                opt_s.step()
-            with torch.no_grad():
-                last_seq_s = torch.tensor(series[-seq_len:], dtype=torch.float32).unsqueeze(0).unsqueeze(-1).to(device)
-                s_pred = s5_model(last_seq_s).detach().cpu().numpy().flatten()
-            s5_df = pd.DataFrame({
-                "ds": pd.date_range(start=test["ds"].min(), periods=horizon, freq=freq),
-                "unique_id": uid,
-                "model": "S5",
-                "forecast": s_pred,
-            })
-            s5_df["ds"] = _strip_tz(s5_df["ds"])
-            s5_val_df = pd.DataFrame({
-                "ds": val["ds"].values,
-                "unique_id": uid,
-                "model": "S5",
-                "forecast": s_pred[: len(val)],
-            })
-            s5_val_df["ds"] = _strip_tz(s5_val_df["ds"])
-        except Exception:
-            s5_ok = False
-            s5_df = pd.DataFrame(columns=["ds", "unique_id", "model", "forecast"])
-            s5_val_df = pd.DataFrame(columns=["ds", "unique_id", "model", "forecast"])
-
-        frames = [sf_fcst_val, lstm_val_df, np_val_df, s5_val_df]
-        frames = [f for f in frames if not f.empty]
-        if not frames:
-            continue
-        combined_val = pd.concat(frames, ignore_index=True)
-        # Align datetime types (drop tz) before merge to avoid dtype mismatch
-        combined_val["ds"] = _strip_tz(combined_val["ds"])
-        val_aligned = val.copy()
-        val_aligned["ds"] = _strip_tz(val_aligned["ds"])
-        combined_val = combined_val.merge(val_aligned.rename(columns={"ds": "ds", "y": "actual"}), on="ds", how="left")
-
-        best_model = None
-        best_rmse = np.inf
-        for model_name, grp in combined_val.groupby("model"):
-            if grp.empty:
-                continue
-            rmse = float(np.sqrt(np.mean((grp["forecast"] - grp["actual"]) ** 2)))
-            if rmse < best_rmse:
-                best_rmse = rmse
-                best_model = model_name
-
-        if best_model is None:
-            continue
-        if best_model == "LSTM":
-            test_fc = lstm_df
-        elif best_model == "NeuralProphet" and np_ok:
-            test_fc = np_test_df
-        elif best_model == "S5" and s5_ok:
-            test_fc = s5_df
-        else:
-            test_fc = sf_fcst[sf_fcst["model"] == best_model]
-
-        expected_return = float(test_fc["forecast"].mean()) if not test_fc.empty else 0.0
-        results.append({"unique_id": uid, "expected_return": expected_return, "model": best_model})
-        # free per-asset tensors
-        try:
-            del X, y_target, lstm_model
-        except Exception:
-            pass
-        try:
-            del X_s, y_s, s5_model
-        except Exception:
-            pass
-        if str(device).startswith("cuda"):
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-
-    return pd.DataFrame(results)
+    result = pd.DataFrame(rows)
+    if result.empty:
+        raise ValueError("Optimizer could not produce any validated asset forecasts.")
+    return result.sort_values("expected_return", ascending=False).reset_index(drop=True)
 
 
-def infer_freq_from_prices(prices: pd.DataFrame) -> str:
-    """Infer pandas frequency code from price data dates."""
-    freq = pd.infer_freq(prices["ds"].sort_values())
-    return freq or "D"
+def build_correlation_graph(returns_df: pd.DataFrame) -> np.ndarray:
+    """Build a correlation-based adjacency matrix between assets."""
+    pivot = returns_df.pivot(index="ds", columns="unique_id", values="y").fillna(0.0)
+    corr = pivot.corr().fillna(0.0).to_numpy()
+    if corr.size == 0:
+        return np.eye(max(1, pivot.shape[1]))
+    return corr
+
+
+def compute_covariance_matrix(returns_matrix: np.ndarray) -> np.ndarray:
+    if returns_matrix.shape[0] <= 1:
+        return np.eye(returns_matrix.shape[1]) * 1e-6
+    if returns_matrix.shape[1] == 1:
+        return np.array([[float(np.var(returns_matrix[:, 0]))]])
+    cov = np.cov(returns_matrix, rowvar=False)
+    if np.ndim(cov) == 0:
+        cov = np.eye(returns_matrix.shape[1]) * float(cov)
+    return np.nan_to_num(cov, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def solve_mean_variance_weights(expected_step_returns: np.ndarray, cov: np.ndarray, risk_aversion: float) -> np.ndarray:
+    """Long-only mean-variance style baseline portfolio."""
+    n_assets = len(expected_step_returns)
+    ridge = max(1e-6, float(risk_aversion) * 0.1)
+    adjusted_cov = cov + np.eye(n_assets) * ridge
+    raw = np.linalg.pinv(adjusted_cov) @ expected_step_returns
+    raw = np.clip(raw, 0.0, None)
+    if raw.sum() <= 0:
+        return np.ones(n_assets) / n_assets
+    return raw / raw.sum()
+
+
+def summarize_portfolio_metrics(
+    weights: np.ndarray,
+    expected_cumulative_returns: np.ndarray,
+    expected_step_returns: np.ndarray,
+    cov: np.ndarray,
+) -> Dict[str, float]:
+    weights = np.asarray(weights, dtype=float)
+    weights = weights / weights.sum() if weights.sum() > 0 else np.ones_like(weights) / len(weights)
+    expected_step = float(np.dot(weights, expected_step_returns))
+    expected_horizon = float(np.dot(weights, expected_cumulative_returns))
+    expected_vol = float(np.sqrt(max(weights @ cov @ weights.T, 0.0)))
+    diversification = float(1.0 / np.sum(np.square(weights)))
+    concentration = float(np.sum(np.square(weights)))
+    return {
+        "expected_step_return": expected_step,
+        "expected_horizon_return": expected_horizon,
+        "expected_volatility": expected_vol,
+        "effective_n_assets": diversification,
+        "weight_concentration": concentration,
+    }
+
+
+def _normalize_weight_vector(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    if arr.size == 0:
+        return arr
+    if np.all(arr >= 0) and np.isfinite(arr).all():
+        total = arr.sum()
+        if 0.999 <= total <= 1.001:
+            return arr
+    arr = np.exp(arr - np.max(arr))
+    total = arr.sum()
+    if total <= 0:
+        return np.ones_like(arr) / len(arr)
+    return arr / total
 
 
 @dataclass
 class Transition:
-    state: Any
     action_logprob: Any
     reward: float
 
 
 class PortfolioEnv:
     """
-    Minimal portfolio environment.
-    State = concatenated forecasted expected returns and current weights.
-    Action = logits mapped to portfolio weights via softmax.
-    Reward = realized portfolio return - risk_aversion * weight variance.
+    State = forecast signal plus current weights.
+    Action = portfolio weights on the simplex.
+    Reward = realized return minus diversification and turnover penalties.
     """
 
     def __init__(
@@ -499,12 +391,14 @@ class PortfolioEnv:
         returns_matrix: np.ndarray,
         forecast_vector: np.ndarray,
         risk_aversion: float = 0.01,
+        turnover_penalty: float = 0.001,
     ):
         self.returns_matrix = returns_matrix
         self.forecast_vector = forecast_vector
         self.t = 0
         self.n_assets = returns_matrix.shape[1]
         self.risk_aversion = risk_aversion
+        self.turnover_penalty = turnover_penalty
         self.weights = np.ones(self.n_assets) / self.n_assets
 
     def reset(self) -> np.ndarray:
@@ -515,28 +409,24 @@ class PortfolioEnv:
     def _get_state(self) -> np.ndarray:
         return np.concatenate([self.forecast_vector, self.weights], axis=0)
 
-    def step(self, action_logits: np.ndarray) -> Tuple[np.ndarray, float, bool]:
-        weights = softmax_np(action_logits)
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool]:
+        weights = _normalize_weight_vector(action)
         realized = self.returns_matrix[self.t]
-        reward = float(np.dot(realized, weights) - self.risk_aversion * np.var(weights))
+        turnover = float(np.abs(weights - self.weights).sum())
+        reward = float(
+            np.dot(realized, weights)
+            - self.risk_aversion * np.var(weights)
+            - self.turnover_penalty * turnover
+        )
         self.weights = weights
         self.t += 1
         done = self.t >= len(self.returns_matrix)
-        next_state = self._get_state()
-        return next_state, reward, done
-
-
-def build_correlation_graph(returns_df: pd.DataFrame) -> np.ndarray:
-    """Build a simple correlation-based adjacency matrix between tickers."""
-    pivot = returns_df.pivot(index="ds", columns="unique_id", values="y").fillna(0.0)
-    corr = pivot.corr().fillna(0.0).values
-    return corr
+        return self._get_state(), reward, done
 
 
 class GraphTradingEnv:
     """
-    Graph-aware trading environment with per-asset buy/hold/sell decisions.
-    Action logits are shaped (n_assets, 3) corresponding to [sell, hold, buy].
+    Graph-aware environment with per-asset sell/hold/buy actions.
     """
 
     def __init__(
@@ -546,14 +436,16 @@ class GraphTradingEnv:
         adjacency: np.ndarray,
         risk_aversion: float = 0.01,
         trade_step: float = 0.05,
+        turnover_penalty: float = 0.001,
     ):
         self.returns_matrix = returns_matrix
         self.forecast_vector = forecast_vector
         self.adjacency = adjacency
-        self.t = 0
-        self.n_assets = returns_matrix.shape[1]
         self.risk_aversion = risk_aversion
         self.trade_step = trade_step
+        self.turnover_penalty = turnover_penalty
+        self.n_assets = returns_matrix.shape[1]
+        self.t = 0
         self.weights = np.ones(self.n_assets) / self.n_assets
 
     def reset(self) -> np.ndarray:
@@ -564,127 +456,150 @@ class GraphTradingEnv:
     def _get_state(self) -> np.ndarray:
         return np.concatenate([self.forecast_vector, self.weights], axis=0)
 
-    def step(self, action_logits: np.ndarray) -> Tuple[np.ndarray, float, bool]:
-        # action_logits expected shape: (n_assets, 3) or flat
-        logits = np.asarray(action_logits).reshape(self.n_assets, 3)
-        # Row-wise softmax
-        exps = np.exp(logits - logits.max(axis=1, keepdims=True))
-        probs = exps / exps.sum(axis=1, keepdims=True)
-        actions = np.argmax(probs, axis=1)  # 0 sell, 1 hold, 2 buy
-        # adjust weights
-        deltas = np.where(actions == 2, self.trade_step, 0) - np.where(actions == 0, self.trade_step, 0)
-        self.weights = np.clip(self.weights + deltas, 0, None)
-        if self.weights.sum() == 0:
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool]:
+        arr = np.asarray(action)
+        actions = np.argmax(arr, axis=1) if arr.ndim == 2 else arr.reshape(-1).astype(int)
+        prev = self.weights.copy()
+        deltas = np.where(actions == 2, self.trade_step, 0.0) - np.where(actions == 0, self.trade_step, 0.0)
+        self.weights = np.clip(self.weights + deltas, 0.0, None)
+        if self.weights.sum() <= 0:
             self.weights = np.ones(self.n_assets) / self.n_assets
         else:
             self.weights = self.weights / self.weights.sum()
-
         realized = self.returns_matrix[self.t]
-        # graph regularization: encourage diversification using adjacency
-        diversification_penalty = float(np.mean(self.weights @ self.adjacency @ self.weights.T))
-        reward = float(np.dot(realized, self.weights) - self.risk_aversion * np.var(self.weights) - 0.01 * diversification_penalty)
+        turnover = float(np.abs(self.weights - prev).sum())
+        diversification_penalty = float(self.weights @ self.adjacency @ self.weights.T)
+        reward = float(
+            np.dot(realized, self.weights)
+            - self.risk_aversion * np.var(self.weights)
+            - 0.01 * diversification_penalty
+            - self.turnover_penalty * turnover
+        )
         self.t += 1
         done = self.t >= len(self.returns_matrix)
-        next_state = self._get_state()
-        return next_state, reward, done
-
-
-def softmax_np(x: np.ndarray) -> np.ndarray:
-    arr = np.asarray(x).reshape(-1)
-    ex = np.exp(arr - np.max(arr))
-    return ex / np.sum(ex)
+        return self._get_state(), reward, done
 
 
 def build_policy_network(input_dim: int, hidden_dim: int, n_assets: int):
-    """Construct a simple MLP policy."""
+    """Construct a compact MLP for weight policies."""
     torch_mod = _lazy_torch()
     nn = torch_mod["nn"]
+    hidden_dim = max(16, int(hidden_dim))
+    mid_dim = max(16, hidden_dim // 2)
     return nn.Sequential(
-        nn.Linear(input_dim, 96),
+        nn.Linear(input_dim, hidden_dim),
         nn.ReLU(),
-        nn.Linear(96, 96),
+        nn.Linear(hidden_dim, hidden_dim),
         nn.ReLU(),
-        nn.Linear(96, 64),
+        nn.Linear(hidden_dim, mid_dim),
         nn.ReLU(),
-        nn.Linear(64, 64),
-        nn.ReLU(),
-        nn.Linear(64, 48),
-        nn.ReLU(),
-        nn.Linear(48, n_assets),
+        nn.Linear(mid_dim, n_assets),
     )
 
 
-def select_action(policy, state, device: str) -> Tuple[np.ndarray, Any]:
-    """Sample an action and return logits for the environment plus log_prob for training."""
+def build_graph_policy_network(input_dim: int, hidden_dim: int, n_assets: int):
+    """Construct a compact MLP for graph-action policies."""
+    torch_mod = _lazy_torch()
+    nn = torch_mod["nn"]
+    hidden_dim = max(16, int(hidden_dim))
+    return nn.Sequential(
+        nn.Linear(input_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Linear(hidden_dim, n_assets * 3),
+    )
+
+
+def _sample_weight_action(policy, state, device: str) -> Tuple[np.ndarray, Any]:
     torch_mod = _lazy_torch()
     torch = torch_mod["torch"]
     logits = policy(state.to(device))
-    # If logits are 1D, treat as weight logits; if 2D, flatten for graph env
-    if logits.dim() == 2:
-        flat_logits = logits
-    else:
-        flat_logits = logits.unsqueeze(0)
-    dist = torch.distributions.Categorical(logits=flat_logits.view(-1))
-    action = dist.sample()
-    log_prob = dist.log_prob(action)
-    return flat_logits.detach().cpu().numpy(), log_prob
+    concentration = torch.nn.functional.softplus(logits) + 1e-3
+    dist = torch.distributions.Dirichlet(concentration)
+    weights = dist.rsample()
+    log_prob = dist.log_prob(weights)
+    return weights.detach().cpu().numpy(), log_prob
+
+
+def _greedy_weight_action(policy, state, device: str) -> np.ndarray:
+    torch_mod = _lazy_torch()
+    torch = torch_mod["torch"]
+    with torch.no_grad():
+        logits = policy(state.to(device))
+        concentration = torch.nn.functional.softplus(logits) + 1e-3
+        weights = concentration / concentration.sum()
+    return weights.detach().cpu().numpy()
+
+
+def _sample_graph_action(policy, state, n_assets: int, device: str) -> Tuple[np.ndarray, Any]:
+    torch_mod = _lazy_torch()
+    torch = torch_mod["torch"]
+    logits = policy(state.to(device)).view(n_assets, 3)
+    dist = torch.distributions.Categorical(logits=logits)
+    actions = dist.sample()
+    log_prob = dist.log_prob(actions).sum()
+    return actions.detach().cpu().numpy(), log_prob
+
+
+def _greedy_graph_action(policy, state, n_assets: int, device: str) -> np.ndarray:
+    torch_mod = _lazy_torch()
+    with torch_mod["torch"].no_grad():
+        logits = policy(state.to(device)).view(n_assets, 3)
+        actions = logits.argmax(dim=1)
+    return actions.detach().cpu().numpy()
 
 
 def train_policy_gradient(
     env: PortfolioEnv,
-    episodes: int = 500,
-    lr: float = 1e-5,
+    episodes: int = 100,
+    lr: float = 1e-3,
     gamma: float = 0.99,
-    hidden_dim: int = 48,
+    hidden_dim: int = 64,
     device: Optional[str] = None,
+    cpu_threads: Optional[int] = None,
     patience: Optional[int] = None,
     min_delta: float = 1e-4,
 ) -> Dict[str, Any]:
-    """
-    Train a REINFORCE agent to propose portfolio weights.
-    Returns metrics history containing episodic rewards and policy metadata.
-    """
+    """Train a REINFORCE allocator over simplex weights."""
     torch_mod = _lazy_torch()
     torch = torch_mod["torch"]
     optim = torch_mod["optim"]
-    base_device = torch_mod.get("device", "cpu")
-    device = device or ("cuda" if base_device == "cuda" and torch.cuda.is_available() else base_device)
+    resolved_device = _resolve_device(device, cpu_threads)
     input_dim = len(env.forecast_vector) + env.n_assets
-    policy = build_policy_network(input_dim, hidden_dim, env.n_assets).to(device)
+    policy = build_policy_network(input_dim, hidden_dim, env.n_assets).to(resolved_device)
     optimizer = optim.Adam(policy.parameters(), lr=lr)
     reward_history: List[float] = []
     best_reward = -np.inf
     patience_ctr = 0
 
     for _ in range(episodes):
-        state = torch.tensor(env.reset(), dtype=torch.float32).to(device)
+        state = torch.tensor(env.reset(), dtype=torch.float32, device=resolved_device)
         transitions: List[Transition] = []
         done = False
+        episode_rewards: List[float] = []
         while not done:
-            action_logits, log_prob = select_action(policy, state, device)
-            next_state_np, reward, done = env.step(action_logits)
-            transitions.append(Transition(state=state, action_logprob=log_prob, reward=reward))
-            state = torch.tensor(next_state_np, dtype=torch.float32).to(device)
+            weights, log_prob = _sample_weight_action(policy, state, resolved_device)
+            next_state_np, reward, done = env.step(weights)
+            transitions.append(Transition(action_logprob=log_prob, reward=reward))
+            episode_rewards.append(reward)
+            state = torch.tensor(next_state_np, dtype=torch.float32, device=resolved_device)
 
-        # Compute returns and policy loss
         returns: List[float] = []
         G = 0.0
-        for t in reversed(transitions):
-            G = t.reward + gamma * G
+        for trans in reversed(transitions):
+            G = trans.reward + gamma * G
             returns.insert(0, G)
-        returns_tensor = torch.tensor(returns, dtype=torch.float32, device=device)
-        returns_tensor = (returns_tensor - returns_tensor.mean()) / (returns_tensor.std() + 1e-8)
-
-        policy_loss = []
-        for R, trans in zip(returns_tensor, transitions):
-            policy_loss.append(-trans.action_logprob * R)
-        loss = torch.stack(policy_loss).sum()
+        returns_tensor = torch.tensor(returns, dtype=torch.float32, device=resolved_device)
+        if len(returns_tensor) > 1:
+            returns_tensor = (returns_tensor - returns_tensor.mean()) / (returns_tensor.std() + 1e-8)
+        loss = torch.stack([-trans.action_logprob * R for R, trans in zip(returns_tensor, transitions)]).sum()
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        avg_reward = float(np.mean([t.reward for t in transitions]))
+        avg_reward = float(np.mean(episode_rewards)) if episode_rewards else 0.0
         reward_history.append(avg_reward)
         if patience is not None:
             if avg_reward > best_reward + min_delta:
@@ -695,70 +610,69 @@ def train_policy_gradient(
                 if patience_ctr >= patience:
                     break
 
-    metadata = {
-        "input_dim": input_dim,
-        "hidden_dim": hidden_dim,
-        "n_assets": env.n_assets,
+    return {
+        "policy": policy,
+        "rewards": reward_history,
+        "device": resolved_device,
+        "metadata": {
+            "input_dim": input_dim,
+            "hidden_dim": hidden_dim,
+            "n_assets": env.n_assets,
+            "policy_type": "weights",
+        },
     }
-    return {"policy": policy, "rewards": reward_history, "device": device, "metadata": metadata}
 
 
 def train_policy_gradient_graph(
     env: GraphTradingEnv,
-    episodes: int = 500,
-    lr: float = 1e-5,
+    episodes: int = 100,
+    lr: float = 1e-3,
     gamma: float = 0.99,
-    hidden_dim: int = 48,
+    hidden_dim: int = 64,
     device: Optional[str] = None,
+    cpu_threads: Optional[int] = None,
     patience: Optional[int] = None,
     min_delta: float = 1e-4,
 ) -> Dict[str, Any]:
-    """Train REINFORCE on graph trading env with per-asset buy/hold/sell actions."""
+    """Train REINFORCE on graph buy/hold/sell actions."""
     torch_mod = _lazy_torch()
     torch = torch_mod["torch"]
-    nn = torch_mod["nn"]
     optim = torch_mod["optim"]
-    base_device = torch_mod.get("device", "cpu")
-    device = device or ("cuda" if base_device == "cuda" and torch.cuda.is_available() else base_device)
+    resolved_device = _resolve_device(device, cpu_threads)
     input_dim = len(env.forecast_vector) + env.n_assets
-    policy = nn.Sequential(
-        nn.Linear(input_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, env.n_assets * 3),
-    ).to(device)
+    policy = build_graph_policy_network(input_dim, hidden_dim, env.n_assets).to(resolved_device)
     optimizer = optim.Adam(policy.parameters(), lr=lr)
     reward_history: List[float] = []
     best_reward = -np.inf
     patience_ctr = 0
 
     for _ in range(episodes):
-        state = torch.tensor(env.reset(), dtype=torch.float32).to(device)
+        state = torch.tensor(env.reset(), dtype=torch.float32, device=resolved_device)
         transitions: List[Transition] = []
         done = False
+        episode_rewards: List[float] = []
         while not done:
-            action_logits, log_prob = select_action(policy, state, device)
-            next_state_np, reward, done = env.step(action_logits.reshape(env.n_assets, 3))
-            transitions.append(Transition(state=state, action_logprob=log_prob, reward=reward))
-            state = torch.tensor(next_state_np, dtype=torch.float32).to(device)
+            actions, log_prob = _sample_graph_action(policy, state, env.n_assets, resolved_device)
+            next_state_np, reward, done = env.step(actions)
+            transitions.append(Transition(action_logprob=log_prob, reward=reward))
+            episode_rewards.append(reward)
+            state = torch.tensor(next_state_np, dtype=torch.float32, device=resolved_device)
 
         returns: List[float] = []
         G = 0.0
-        for t in reversed(transitions):
-            G = t.reward + gamma * G
+        for trans in reversed(transitions):
+            G = trans.reward + gamma * G
             returns.insert(0, G)
-        returns_tensor = torch.tensor(returns, dtype=torch.float32, device=device)
-        returns_tensor = (returns_tensor - returns_tensor.mean()) / (returns_tensor.std() + 1e-8)
-
-        policy_loss = []
-        for R, trans in zip(returns_tensor, transitions):
-            policy_loss.append(-trans.action_logprob * R)
-        loss = torch.stack(policy_loss).sum()
+        returns_tensor = torch.tensor(returns, dtype=torch.float32, device=resolved_device)
+        if len(returns_tensor) > 1:
+            returns_tensor = (returns_tensor - returns_tensor.mean()) / (returns_tensor.std() + 1e-8)
+        loss = torch.stack([-trans.action_logprob * R for R, trans in zip(returns_tensor, transitions)]).sum()
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        avg_reward = float(np.mean([t.reward for t in transitions]))
+        avg_reward = float(np.mean(episode_rewards)) if episode_rewards else 0.0
         reward_history.append(avg_reward)
         if patience is not None:
             if avg_reward > best_reward + min_delta:
@@ -769,47 +683,55 @@ def train_policy_gradient_graph(
                 if patience_ctr >= patience:
                     break
 
-    metadata = {"input_dim": input_dim, "hidden_dim": hidden_dim, "n_assets": env.n_assets}
-    return {"policy": policy, "rewards": reward_history, "device": device, "metadata": metadata}
+    return {
+        "policy": policy,
+        "rewards": reward_history,
+        "device": resolved_device,
+        "metadata": {
+            "input_dim": input_dim,
+            "hidden_dim": hidden_dim,
+            "n_assets": env.n_assets,
+            "policy_type": "graph",
+        },
+    }
 
 
 def recommend_weights(policy, env: PortfolioEnv, device: str) -> np.ndarray:
-    """Generate deterministic weights from the trained policy given current state."""
+    """Generate deterministic weights from a trained weight policy."""
     torch_mod = _lazy_torch()
-    torch = torch_mod["torch"]
-    # Ensure state lives on same device as policy parameters
-    policy_device = next(policy.parameters()).device
-    state = torch.tensor(env.reset(), dtype=torch.float32, device=policy_device)
-    with torch.no_grad():
-        logits = policy(state)
-        weights = torch.softmax(logits, dim=-1).cpu().numpy()
-    return weights
+    state = torch_mod["torch"].tensor(env.reset(), dtype=torch_mod["torch"].float32, device=device)
+    return _greedy_weight_action(policy, state, device)
 
 
-def simulate_policy_path_weights(policy, returns_matrix: np.ndarray, risk_aversion: float = 0.01) -> pd.DataFrame:
-    """Simulate a single greedy path using a weight-based policy to log weights and P&L."""
-    env = PortfolioEnv(returns_matrix=returns_matrix, forecast_vector=np.zeros(returns_matrix.shape[1]), risk_aversion=risk_aversion)
+def simulate_policy_path_weights(
+    policy,
+    returns_matrix: np.ndarray,
+    forecast_vector: np.ndarray,
+    risk_aversion: float = 0.01,
+    device: str = "cpu",
+) -> pd.DataFrame:
+    """Simulate a greedy path using a weight policy."""
     torch_mod = _lazy_torch()
     torch = torch_mod["torch"]
-    state = torch.tensor(env.reset(), dtype=torch.float32, device=next(policy.parameters()).device)
+    env = PortfolioEnv(returns_matrix=returns_matrix, forecast_vector=forecast_vector, risk_aversion=risk_aversion)
+    state = torch.tensor(env.reset(), dtype=torch.float32, device=device)
     records = []
     step = 0
     done = False
     while not done:
-        with torch.no_grad():
-            logits = policy(state)
-            weights = torch.softmax(logits, dim=-1).cpu().numpy()
+        weights = _greedy_weight_action(policy, state, device)
         next_state, reward, done = env.step(weights)
-        records.append({"step": step, "reward": reward, "weights": weights})
-        state = torch.tensor(next_state, dtype=torch.float32, device=next(policy.parameters()).device)
+        records.append({"step": step, "reward": reward, "weights": np.round(weights, 4)})
+        state = torch.tensor(next_state, dtype=torch.float32, device=device)
         step += 1
     df = pd.DataFrame(records)
-    df["cum_reward"] = df["reward"].cumsum()
+    if not df.empty:
+        df["cum_reward"] = df["reward"].cumsum()
     return df
 
 
 def simulate_policy_path_graph(policy, env: GraphTradingEnv, device: str) -> pd.DataFrame:
-    """Simulate a greedy path on the graph trading env, logging actions and P&L."""
+    """Simulate a greedy path on the graph environment."""
     torch_mod = _lazy_torch()
     torch = torch_mod["torch"]
     state = torch.tensor(env.reset(), dtype=torch.float32, device=device)
@@ -817,16 +739,14 @@ def simulate_policy_path_graph(policy, env: GraphTradingEnv, device: str) -> pd.
     step = 0
     done = False
     while not done:
-        with torch.no_grad():
-            logits = policy(state)
-        logits_np = logits.detach().cpu().numpy().reshape(env.n_assets, 3)
-        actions = np.argmax(logits_np, axis=1)
-        next_state, reward, done = env.step(logits_np)
-        records.append({"step": step, "reward": reward, "actions": actions})
+        actions = _greedy_graph_action(policy, state, env.n_assets, device)
+        next_state, reward, done = env.step(actions)
+        records.append({"step": step, "reward": reward, "actions": actions.tolist(), "weights": np.round(env.weights, 4)})
         state = torch.tensor(next_state, dtype=torch.float32, device=device)
         step += 1
     df = pd.DataFrame(records)
-    df["cum_reward"] = df["reward"].cumsum()
+    if not df.empty:
+        df["cum_reward"] = df["reward"].cumsum()
     return df
 
 
@@ -837,80 +757,92 @@ def simulate_policy_graph_topn(
     runs: int = 100,
     top_n: int = 10,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Run multiple stochastic rollouts on the graph env, sampling actions from the policy,
-    and return top-N portfolios by cumulative reward plus the best action log.
-    """
+    """Run multiple stochastic graph rollouts and return the best portfolios."""
     torch_mod = _lazy_torch()
     torch = torch_mod["torch"]
     portfolios = []
-    best_log = None
+    best_log = pd.DataFrame()
     best_reward = -np.inf
     for _ in range(runs):
-        env.reset()
         state = torch.tensor(env.reset(), dtype=torch.float32, device=device)
         done = False
-        rewards = []
+        records = []
         while not done:
-            logits = policy(state)
-            probs = torch.softmax(logits.view(-1), dim=0)
-            action_sample = torch.distributions.Categorical(probs=probs).sample()
-            logits_np = logits.detach().cpu().numpy().reshape(env.n_assets, 3)
-            actions = np.argmax(logits_np, axis=1)
-            next_state, reward, done = env.step(logits_np)
-            rewards.append(reward)
+            actions, _ = _sample_graph_action(policy, state, env.n_assets, device)
+            next_state, reward, done = env.step(actions)
+            records.append({"step": len(records), "reward": reward, "actions": actions.tolist(), "weights": np.round(env.weights, 4)})
             state = torch.tensor(next_state, dtype=torch.float32, device=device)
-        total_reward = float(np.sum(rewards))
-        buy_mask = (actions == 2).astype(float)
-        if buy_mask.sum() == 0:
-            buy_mask = np.ones_like(buy_mask)
-        weights = buy_mask / buy_mask.sum()
-        portfolios.append({"weights": weights, "reward": total_reward})
+        total_reward = float(sum(r["reward"] for r in records))
+        portfolios.append({"weights": env.weights.copy(), "reward": total_reward})
         if total_reward > best_reward:
             best_reward = total_reward
-            best_log = pd.DataFrame({"step": range(len(rewards)), "reward": rewards})
-            best_log["cum_reward"] = best_log["reward"].cumsum()
+            best_log = pd.DataFrame(records)
+            if not best_log.empty:
+                best_log["cum_reward"] = best_log["reward"].cumsum()
     portfolios_df = pd.DataFrame(portfolios).sort_values("reward", ascending=False).head(top_n).reset_index(drop=True)
     return portfolios_df, best_log
 
 
 def save_policy_checkpoint(policy, path: str, metadata: Dict[str, Any]) -> None:
-    """Persist policy weights and metadata to disk for later inference."""
+    """Persist policy weights and metadata to disk."""
     torch_mod = _lazy_torch()
     torch = torch_mod["torch"]
     path_obj = Path(path)
     path_obj.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"state_dict": policy.state_dict(), "metadata": metadata}
-    torch.save(payload, path_obj)
+    torch.save({"state_dict": policy.state_dict(), "metadata": metadata}, path_obj)
 
 
 def load_checkpoint_payload(path: str) -> Dict[str, Any]:
-    """Load raw checkpoint payload from disk."""
+    """Load a checkpoint payload from disk."""
     torch_mod = _lazy_torch()
     torch = torch_mod["torch"]
     path_obj = Path(path)
     if not path_obj.exists():
         raise FileNotFoundError(f"Checkpoint not found at {path}")
-    payload = torch.load(path_obj, map_location="cpu")
-    return payload
+    return torch.load(path_obj, map_location="cpu")
 
 
 def load_policy_checkpoint(path: str, input_dim: int, hidden_dim: int, n_assets: int):
-    """Load policy checkpoint and rebuild the network."""
+    """Load a weight-policy checkpoint."""
     payload = load_checkpoint_payload(path)
     policy = build_policy_network(input_dim, hidden_dim, n_assets)
     policy.load_state_dict(payload["state_dict"])
     policy.eval()
-    metadata = payload.get("metadata", {})
-    return policy, metadata
+    return policy, payload.get("metadata", {})
+
+
+def _assemble_portfolio_frame(
+    asset_order: List[str],
+    weights: np.ndarray,
+    forecast_table: pd.DataFrame,
+) -> pd.DataFrame:
+    lookup = forecast_table.set_index("unique_id")
+    rows = []
+    for asset, weight in zip(asset_order, weights):
+        info = lookup.loc[asset]
+        rows.append(
+            {
+                "asset": asset,
+                "weight": float(weight),
+                "expected_return": float(info["expected_return"]),
+                "mean_forecast_return": float(info["mean_forecast_return"]),
+                "forecast_volatility": float(info["forecast_volatility"]),
+                "model": str(info["model"]),
+                "validation_rmse": float(info["validation_rmse"]),
+            }
+        )
+    portfolio = pd.DataFrame(rows)
+    if not portfolio.empty and portfolio["weight"].sum() > 0:
+        portfolio["weight"] = portfolio["weight"] / portfolio["weight"].sum()
+    return portfolio.sort_values("weight", ascending=False).reset_index(drop=True)
 
 
 def optimize_portfolio(
     prices: pd.DataFrame,
     horizon: int,
     top_k: int,
-    episodes: int = 500,
-    lr: float = 1e-5,
+    episodes: int = 100,
+    lr: float = 1e-3,
     risk_aversion: float = 0.02,
     checkpoint_path: Optional[str] = None,
     date_col: str = "ds",
@@ -920,74 +852,135 @@ def optimize_portfolio(
     device: Optional[str] = None,
     rl_mode: str = "weights",
     forecast_params: Optional[Dict[str, Any]] = None,
+    rl_hidden_dim: int = 64,
+    cpu_threads: int = 8,
     rl_patience: Optional[int] = None,
     rl_min_delta: float = 1e-4,
 ) -> Dict[str, Any]:
     """
-    End-to-end pipeline: compute returns, forecast expected returns with statsforecast,
-    train RL agent, and return recommended weights for top-k assets by expected return.
+    End-to-end optimizer pipeline with validated asset forecasts, a mean-variance
+    baseline, and optional RL refinement.
     """
     prices = format_price_frame(prices, date_col=date_col, price_col=price_col, ticker_col=ticker_col)
     prices = clean_price_frame(prices)
     if resample_rule:
         prices = resample_prices(prices, resample_rule)
     returns_df = prepare_returns(prices)
-    freq = infer_freq_from_prices(prices) or "D"
-    expected = forecast_asset_returns(returns_df, horizon=horizon, freq=freq, device=device, forecast_params=forecast_params)
-    expected = expected.sort_values("expected_return", ascending=False)
-    selected_assets = expected.head(top_k)["unique_id"].tolist()
-    filtered_returns = returns_df[returns_df["unique_id"].isin(selected_assets)]
-
-    pivot = filtered_returns.pivot(index="ds", columns="unique_id", values="y").fillna(0.0)
-    returns_matrix = pivot.values
-    forecast_vector = expected.set_index("unique_id").loc[selected_assets]["expected_return"].values
-
-    action_log = None
-    if rl_mode == "graph":
-        adjacency = build_correlation_graph(filtered_returns)
-        env = GraphTradingEnv(
-            returns_matrix=returns_matrix,
-            forecast_vector=forecast_vector,
-            adjacency=adjacency,
-            risk_aversion=risk_aversion,
-        )
-        training = train_policy_gradient_graph(env, episodes=episodes, lr=lr, device=device, patience=rl_patience, min_delta=rl_min_delta)
-        # simulate stochastic rollouts to get top portfolios
-        top_ports, best_log = simulate_policy_graph_topn(
-            training["policy"],
-            env,
-            device=training["device"],
-            runs=100,
-            top_n=min(10, top_k if top_k > 0 else 10),
-        )
-        action_log = best_log
-        # use best portfolio weights from top list
-        weights = top_ports.iloc[0]["weights"]
-    else:
-        env = PortfolioEnv(returns_matrix=returns_matrix, forecast_vector=forecast_vector, risk_aversion=risk_aversion)
-        training = train_policy_gradient(env, episodes=episodes, lr=lr, device=device, patience=rl_patience, min_delta=rl_min_delta)
-        weights = recommend_weights(training["policy"], env, training["device"])
-        action_log = simulate_policy_path_weights(training["policy"], returns_matrix, risk_aversion=risk_aversion)
-    portfolio = pd.DataFrame(
-        {
-            "asset": selected_assets,
-            "weight": weights,
-            "expected_return": forecast_vector,
-        }
+    freq = infer_freq_from_prices(prices)
+    forecast_table = forecast_asset_returns(
+        returns_df,
+        horizon=horizon,
+        freq=freq,
+        device=device,
+        forecast_params=forecast_params,
+        cpu_threads=cpu_threads,
     )
-    portfolio["weight"] = portfolio["weight"] / portfolio["weight"].sum()
 
-    # Save optional checkpoint for reuse
-    if checkpoint_path:
-        metadata = training["metadata"] | {"assets": selected_assets, "risk_aversion": risk_aversion}
-        save_policy_checkpoint(training["policy"], checkpoint_path, metadata)
+    top_k = max(1, min(int(top_k), len(forecast_table)))
+    selected_assets = forecast_table.head(top_k)["unique_id"].tolist()
+    selected_forecasts = forecast_table.set_index("unique_id").loc[selected_assets].reset_index()
+    filtered_returns = returns_df[returns_df["unique_id"].isin(selected_assets)]
+    pivot = filtered_returns.pivot(index="ds", columns="unique_id", values="y").reindex(columns=selected_assets).fillna(0.0)
+    if pivot.empty:
+        raise ValueError("Selected assets do not have usable return history for optimization.")
+    returns_matrix = pivot.to_numpy()
+    mean_step_returns = selected_forecasts["mean_forecast_return"].to_numpy(dtype=float)
+    expected_horizon_returns = selected_forecasts["expected_return"].to_numpy(dtype=float)
+    cov = compute_covariance_matrix(returns_matrix)
 
+    baseline_weights = solve_mean_variance_weights(mean_step_returns, cov, risk_aversion)
+    baseline_portfolio = _assemble_portfolio_frame(selected_assets, baseline_weights, selected_forecasts)
+    baseline_metrics = summarize_portfolio_metrics(baseline_weights, expected_horizon_returns, mean_step_returns, cov)
+
+    reward_history: List[float] = []
+    action_log = pd.DataFrame()
+    top_portfolios = None
+    optimizer_engine = "mean_variance"
+    weights = baseline_weights.copy()
+    checkpoint_meta: Dict[str, Any] = {}
+
+    try:
+        if rl_mode == "graph":
+            adjacency = build_correlation_graph(filtered_returns)
+            env = GraphTradingEnv(
+                returns_matrix=returns_matrix,
+                forecast_vector=mean_step_returns,
+                adjacency=adjacency,
+                risk_aversion=risk_aversion,
+            )
+            training = train_policy_gradient_graph(
+                env,
+                episodes=episodes,
+                lr=lr,
+                hidden_dim=rl_hidden_dim,
+                device=device,
+                cpu_threads=cpu_threads,
+                patience=rl_patience,
+                min_delta=rl_min_delta,
+            )
+            reward_history = training["rewards"]
+            top_portfolios, action_log = simulate_policy_graph_topn(
+                training["policy"],
+                env,
+                device=training["device"],
+                runs=100,
+                top_n=min(10, len(selected_assets)),
+            )
+            if top_portfolios is not None and not top_portfolios.empty:
+                weights = np.asarray(top_portfolios.iloc[0]["weights"], dtype=float)
+            checkpoint_meta = training["metadata"] | {"assets": selected_assets, "risk_aversion": risk_aversion, "rl_mode": "graph"}
+            if checkpoint_path:
+                save_policy_checkpoint(training["policy"], checkpoint_path, checkpoint_meta)
+            optimizer_engine = "rl_graph"
+        else:
+            env = PortfolioEnv(returns_matrix=returns_matrix, forecast_vector=mean_step_returns, risk_aversion=risk_aversion)
+            training = train_policy_gradient(
+                env,
+                episodes=episodes,
+                lr=lr,
+                hidden_dim=rl_hidden_dim,
+                device=device,
+                cpu_threads=cpu_threads,
+                patience=rl_patience,
+                min_delta=rl_min_delta,
+            )
+            reward_history = training["rewards"]
+            weights = recommend_weights(training["policy"], env, training["device"])
+            action_log = simulate_policy_path_weights(
+                training["policy"],
+                returns_matrix,
+                forecast_vector=mean_step_returns,
+                risk_aversion=risk_aversion,
+                device=training["device"],
+            )
+            checkpoint_meta = training["metadata"] | {"assets": selected_assets, "risk_aversion": risk_aversion, "rl_mode": "weights"}
+            if checkpoint_path:
+                save_policy_checkpoint(training["policy"], checkpoint_path, checkpoint_meta)
+            optimizer_engine = "rl_weights"
+    except ImportError:
+        pass
+
+    portfolio = _assemble_portfolio_frame(selected_assets, weights, selected_forecasts)
+    portfolio_metrics = summarize_portfolio_metrics(
+        portfolio["weight"].to_numpy(),
+        portfolio["expected_return"].to_numpy(),
+        portfolio["mean_forecast_return"].to_numpy(),
+        cov,
+    )
     return {
         "portfolio": portfolio,
-        "reward_history": training["rewards"],
+        "baseline_portfolio": baseline_portfolio,
+        "forecast_summary": selected_forecasts.sort_values("expected_return", ascending=False).reset_index(drop=True),
+        "reward_history": reward_history,
         "selected_assets": selected_assets,
         "action_log": action_log,
-        "top_portfolios": top_ports if rl_mode == "graph" else None,
+        "top_portfolios": top_portfolios,
+        "portfolio_metrics": portfolio_metrics,
+        "baseline_metrics": baseline_metrics,
+        "optimizer_engine": optimizer_engine,
+        "checkpoint_meta": checkpoint_meta,
+        "covariance_matrix": pd.DataFrame(cov, index=selected_assets, columns=selected_assets),
+        "missing_assets": [],
     }
 
 
@@ -1003,14 +996,15 @@ def optimize_portfolio_inference(
     device: Optional[str] = None,
     rl_mode: str = "weights",
     forecast_params: Optional[Dict[str, Any]] = None,
+    cpu_threads: int = 8,
 ) -> Dict[str, Any]:
     """
-    Inference-only pipeline: load a pre-trained policy checkpoint and produce weights
-    for the assets seen during training. Forecasts are recomputed for current prices.
+    Inference-only pipeline using a saved policy checkpoint plus fresh asset forecasts.
+    Missing assets are zero-filled and then zero-weighted before final normalization.
     """
     payload = load_checkpoint_payload(checkpoint_path)
-    metadata_tmp = payload.get("metadata", {})
-    trained_assets: List[str] = metadata_tmp.get("assets", [])
+    metadata = payload.get("metadata", {})
+    trained_assets: List[str] = metadata.get("assets", [])
     if not trained_assets:
         raise ValueError("Checkpoint is missing asset metadata.")
 
@@ -1019,64 +1013,109 @@ def optimize_portfolio_inference(
     if resample_rule:
         prices = resample_prices(prices, resample_rule)
     returns_df = prepare_returns(prices)
-    freq = infer_freq_from_prices(prices) or "D"
-    expected = forecast_asset_returns(returns_df, horizon=horizon, freq=freq, device=device, forecast_params=forecast_params)
-    expected = expected[expected["unique_id"].isin(trained_assets)]
-    expected = expected.set_index("unique_id").loc[trained_assets].reset_index()
+    freq = infer_freq_from_prices(prices)
+    forecast_table = forecast_asset_returns(
+        returns_df,
+        horizon=horizon,
+        freq=freq,
+        device=device,
+        forecast_params=forecast_params,
+        cpu_threads=cpu_threads,
+    ).set_index("unique_id")
+    missing_assets = [asset for asset in trained_assets if asset not in forecast_table.index]
+    for asset in missing_assets:
+        forecast_table.loc[asset] = {
+            "model": "Unavailable",
+            "validation_rmse": np.nan,
+            "validation_mae": np.nan,
+            "validation_smape": np.nan,
+            "mean_forecast_return": 0.0,
+            "expected_return": 0.0,
+            "forecast_volatility": 0.0,
+            "forecast_path": [0.0] * horizon,
+        }
+    selected_forecasts = forecast_table.loc[trained_assets].reset_index()
 
     filtered_returns = returns_df[returns_df["unique_id"].isin(trained_assets)]
-    pivot = filtered_returns.pivot(index="ds", columns="unique_id", values="y").fillna(0.0)
+    pivot = filtered_returns.pivot(index="ds", columns="unique_id", values="y").reindex(columns=trained_assets).fillna(0.0)
     if pivot.empty:
         raise ValueError("No overlapping assets between checkpoint and current price data.")
-    returns_matrix = pivot[trained_assets].values
-    forecast_vector = expected["expected_return"].values
+    returns_matrix = pivot.to_numpy()
+    mean_step_returns = selected_forecasts["mean_forecast_return"].to_numpy(dtype=float)
+    expected_horizon_returns = selected_forecasts["expected_return"].to_numpy(dtype=float)
+    cov = compute_covariance_matrix(returns_matrix)
 
-    # Rebuild policy with correct dimensions from metadata
-    input_dim = metadata_tmp.get("input_dim", len(forecast_vector) * 2)
-    hidden_dim = metadata_tmp.get("hidden_dim", 48)
-    n_assets = metadata_tmp.get("n_assets", len(trained_assets))
-    torch_mod = _lazy_torch()
-    base_device = torch_mod.get("device", "cpu")
-    device = device or ("cuda" if base_device == "cuda" and torch_mod["torch"].cuda.is_available() else base_device)
-    policy = build_policy_network(input_dim, hidden_dim, n_assets).to(device)
+    baseline_weights = solve_mean_variance_weights(mean_step_returns, cov, risk_aversion)
+    baseline_portfolio = _assemble_portfolio_frame(trained_assets, baseline_weights, selected_forecasts)
+    baseline_metrics = summarize_portfolio_metrics(baseline_weights, expected_horizon_returns, mean_step_returns, cov)
+
+    input_dim = int(metadata.get("input_dim", len(trained_assets) * 2))
+    hidden_dim = int(metadata.get("hidden_dim", 64))
+    n_assets = int(metadata.get("n_assets", len(trained_assets)))
+    policy_type = str(metadata.get("policy_type", "weights"))
+    checkpoint_rl_mode = str(metadata.get("rl_mode", rl_mode))
+    resolved_device = _resolve_device(device, cpu_threads)
+
+    if policy_type == "graph" or checkpoint_rl_mode == "graph":
+        policy = build_graph_policy_network(input_dim, hidden_dim, n_assets).to(resolved_device)
+    else:
+        policy = build_policy_network(input_dim, hidden_dim, n_assets).to(resolved_device)
     policy.load_state_dict(payload["state_dict"])
     policy.eval()
-    metadata = metadata_tmp
 
-    action_log = None
-    if rl_mode == "graph":
+    if checkpoint_rl_mode == "graph":
         adjacency = build_correlation_graph(filtered_returns)
         env = GraphTradingEnv(
             returns_matrix=returns_matrix,
-            forecast_vector=forecast_vector,
+            forecast_vector=mean_step_returns,
             adjacency=adjacency,
             risk_aversion=risk_aversion,
         )
-        top_ports, best_log = simulate_policy_graph_topn(
+        top_portfolios, action_log = simulate_policy_graph_topn(
             policy,
             env,
-            device=device,
+            device=resolved_device,
             runs=100,
-            top_n=min(10, n_assets if n_assets > 0 else 10),
+            top_n=min(10, len(trained_assets)),
         )
-        action_log = best_log
-        weights = top_ports.iloc[0]["weights"]
+        weights = np.asarray(top_portfolios.iloc[0]["weights"], dtype=float) if not top_portfolios.empty else baseline_weights
+        optimizer_engine = "rl_graph_inference"
     else:
-        env = PortfolioEnv(returns_matrix=returns_matrix, forecast_vector=forecast_vector, risk_aversion=risk_aversion)
-        weights = recommend_weights(policy, env, device=device)
-        action_log = simulate_policy_path_weights(policy, returns_matrix, risk_aversion=risk_aversion)
-    portfolio = pd.DataFrame(
-        {
-            "asset": trained_assets,
-            "weight": weights,
-            "expected_return": forecast_vector,
-        }
+        env = PortfolioEnv(returns_matrix=returns_matrix, forecast_vector=mean_step_returns, risk_aversion=risk_aversion)
+        weights = recommend_weights(policy, env, device=resolved_device)
+        action_log = simulate_policy_path_weights(
+            policy,
+            returns_matrix,
+            forecast_vector=mean_step_returns,
+            risk_aversion=risk_aversion,
+            device=resolved_device,
+        )
+        top_portfolios = None
+        optimizer_engine = "rl_weights_inference"
+
+    if missing_assets:
+        mask = np.array([asset not in missing_assets for asset in trained_assets], dtype=float)
+        weights = weights * mask
+        weights = weights / weights.sum() if weights.sum() > 0 else baseline_weights
+
+    portfolio = _assemble_portfolio_frame(trained_assets, weights, selected_forecasts)
+    portfolio_metrics = summarize_portfolio_metrics(
+        portfolio["weight"].to_numpy(),
+        portfolio["expected_return"].to_numpy(),
+        portfolio["mean_forecast_return"].to_numpy(),
+        cov,
     )
-    portfolio["weight"] = portfolio["weight"] / portfolio["weight"].sum()
     return {
         "portfolio": portfolio,
+        "baseline_portfolio": baseline_portfolio,
+        "forecast_summary": selected_forecasts.sort_values("expected_return", ascending=False).reset_index(drop=True),
         "selected_assets": trained_assets,
         "checkpoint_meta": metadata,
         "action_log": action_log,
-        "top_portfolios": top_ports if rl_mode == "graph" else None,
+        "top_portfolios": top_portfolios,
+        "portfolio_metrics": portfolio_metrics,
+        "baseline_metrics": baseline_metrics,
+        "optimizer_engine": optimizer_engine,
+        "covariance_matrix": pd.DataFrame(cov, index=trained_assets, columns=trained_assets),
+        "missing_assets": missing_assets,
     }

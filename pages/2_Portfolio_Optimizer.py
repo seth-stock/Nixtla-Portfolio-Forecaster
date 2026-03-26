@@ -1,34 +1,37 @@
 """
 Portfolio Optimizer page
-Uses Nixtla forecasts per asset and a lightweight PyTorch policy-gradient
-agent to propose portfolio weights.
+Combines validated Nixtla forecasts with a mean-variance baseline and an
+optional RL policy.
 """
 
 from __future__ import annotations
 
-from typing import List
+import os
 from pathlib import Path
+from typing import List
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 import psutil
 
+from core.alpaca_data import (
+    configure_alpaca_credentials,
+    fetch_daily_bars,
+    fetch_intraday_bars,
+)
 from core.portfolio_rl import (
     format_price_frame,
     load_prices_from_files,
     optimize_portfolio,
     optimize_portfolio_inference,
 )
-from core.alpaca_data import fetch_daily_bars, fetch_intraday_bars
-from core import data_loading
 
 
 def resource_monitor():
     with st.sidebar.expander("Resource Monitor", expanded=False):
-        cpu = psutil.cpu_percent(interval=0.2)
+        cpu = psutil.cpu_percent(interval=0.1)
         mem = psutil.virtual_memory()
         st.write(f"CPU: {cpu:.1f}%")
         st.write(f"RAM: {mem.percent:.1f}% ({(mem.used/1e9):.2f} GB / {(mem.total/1e9):.2f} GB)")
@@ -49,7 +52,7 @@ def sidebar_controls():
     st.sidebar.header("Data Input")
     data_source = st.sidebar.radio(
         "Source",
-        ["Upload CSV/Files", "Fetch via Alpaca (daily)", "Fetch via Alpaca (minute)"]
+        ["Upload CSV/Files", "Fetch via Alpaca (daily)", "Fetch via Alpaca (minute)"],
     )
     upload_mode = None
     uploaded_single = None
@@ -61,22 +64,26 @@ def sidebar_controls():
     alpaca_tickers = "AAPL,MSFT,GOOG"
     alpaca_start = pd.to_datetime("2022-01-01").date()
     alpaca_end = pd.to_datetime("today").date()
-    alpaca_api_key = ""
-    alpaca_api_secret = ""
+    alpaca_api_key = st.session_state.get("po_alpaca_key", os.getenv("ALPACA_API_KEY", ""))
+    alpaca_api_secret = st.session_state.get("po_alpaca_secret", os.getenv("ALPACA_API_SECRET", ""))
 
     if data_source == "Upload CSV/Files":
         upload_mode = st.sidebar.radio(
             "Upload type",
-            ["Single CSV (all tickers)", "Multiple CSV files (one per ticker)"]
+            ["Single CSV (all tickers)", "Multiple CSV files (one per ticker)"],
         )
         if upload_mode == "Single CSV (all tickers)":
             uploaded_single = st.sidebar.file_uploader(
-                "Upload multi-asset price CSV (>=2 years of data)", type=["csv"], accept_multiple_files=False
+                "Upload multi-asset price CSV",
+                type=["csv"],
+                accept_multiple_files=False,
             )
             files_have_ticker = True
         else:
             uploaded_multi = st.sidebar.file_uploader(
-                "Upload folder worth of CSVs (select multiple files)", type=["csv"], accept_multiple_files=True
+                "Upload multiple ticker CSV files",
+                type=["csv"],
+                accept_multiple_files=True,
             )
             files_have_ticker = st.sidebar.checkbox("Files already contain ticker column", value=False)
         date_col = st.sidebar.text_input("Date column", value="ds")
@@ -86,39 +93,34 @@ def sidebar_controls():
         alpaca_tickers = st.sidebar.text_input("Alpaca tickers (comma-separated)", value="AAPL,MSFT,GOOG")
         alpaca_start = st.sidebar.date_input("Start date", value=alpaca_start)
         alpaca_end = st.sidebar.date_input("End date", value=alpaca_end)
-        alpaca_api_key = st.sidebar.text_input("Alpaca API Key", type="password")
-        alpaca_api_secret = st.sidebar.text_input("Alpaca API Secret", type="password")
+        st.sidebar.caption("Enter Alpaca credentials for this session, or leave the environment defaults in place.")
+        alpaca_api_key = st.sidebar.text_input("Alpaca API Key", type="password", value=alpaca_api_key, key="po_alpaca_key")
+        alpaca_api_secret = st.sidebar.text_input("Alpaca API Secret", type="password", value=alpaca_api_secret, key="po_alpaca_secret")
 
+    st.sidebar.header("Forecast Settings")
     horizon = st.sidebar.slider("Forecast horizon (steps)", 1, 120, 20)
-    resample_rule = st.sidebar.text_input("Resample rule (e.g., 1D, 1H, 10min)", value="1D")
+    resample_rule = st.sidebar.text_input("Resample rule (e.g. 1D, 1H, 10min)", value="1D")
+    with st.sidebar.expander("Forecast Model Params"):
+        sf_season = st.number_input("Season length (SeasonalNaive fallback)", min_value=1, value=5, step=1)
+        rf_estimators = st.number_input("RF n_estimators", min_value=50, max_value=2000, value=300, step=50)
+        rf_max_depth = st.number_input("RF max_depth (0=auto)", min_value=0, max_value=100, value=8, step=1)
 
-    st.sidebar.header("Checkpoint / Mode")
+    st.sidebar.header("Optimizer Mode")
     mode = st.sidebar.radio("Mode", ["Use pre-trained checkpoint (inference)", "Train new checkpoint locally"])
     checkpoint_path = st.sidebar.text_input("Checkpoint path", value="models/portfolio_policy.pt")
-    rl_mode = st.sidebar.selectbox("RL Mode", ["Continuous Weights", "Graph Trading"], index=0)
-    with st.sidebar.expander("Forecast Model Params"):
-        sf_season = st.number_input("Season length (statsforecast fallback)", min_value=1, value=1, step=1, key="opt_sf_season")
-        lstm_hidden = st.number_input("LSTM hidden size", min_value=16, max_value=512, value=64, step=16, key="opt_lstm_hidden")
-        lstm_layers = st.number_input("LSTM layers", min_value=1, max_value=12, value=6, step=1, key="opt_lstm_layers")
-        lstm_proj = st.number_input("LSTM projection dim", min_value=8, max_value=256, value=32, step=8, key="opt_lstm_proj")
-        lstm_seq = st.number_input("LSTM sequence length", min_value=8, max_value=128, value=30, step=2, key="opt_lstm_seq")
-        lstm_epochs = st.number_input("LSTM epochs", min_value=5, max_value=200, value=25, step=5, key="opt_lstm_epochs")
-        lstm_lr = st.number_input("LSTM learning rate", value=1e-5, format="%.6f", key="opt_lstm_lr")
-        lstm_patience = st.number_input("LSTM patience", min_value=0, max_value=50, value=5, step=1, key="opt_lstm_patience")
-    with st.sidebar.expander("RL Trainer Params"):
-        hidden_dim = st.number_input("Policy hidden dim", min_value=16, max_value=256, value=48, step=16, key="opt_policy_hidden")
-        rl_patience = st.number_input("RL patience (episodes)", min_value=0, max_value=200, value=0, step=10, key="opt_rl_patience")
-        rl_min_delta = st.number_input("RL min delta", value=1e-4, format="%.5f", key="opt_rl_min_delta")
+    rl_mode = st.sidebar.selectbox("Policy type", ["Continuous Weights", "Graph Trading"], index=0)
 
-    st.sidebar.header("RL Settings (for training/local only)")
-    top_k = st.sidebar.slider("Number of holdings (k)", 1, 5, 3)
-    episodes = st.sidebar.slider("Training episodes", 10, 200, 50, step=10)
+    st.sidebar.header("RL Settings")
+    top_k = st.sidebar.slider("Number of holdings (k)", 1, 10, 3)
+    episodes = st.sidebar.slider("Training episodes", 10, 200, 60, step=10)
     lr = st.sidebar.number_input("Learning rate", value=0.001, format="%.4f")
-    risk_aversion = st.sidebar.number_input("Risk aversion penalty", value=0.01, format="%.4f")
-    device_choice = st.sidebar.selectbox("Device", ["cuda", "cpu"], index=0)
-    cpu_threads = 16
-    if device_choice == "cpu":
-        cpu_threads = st.sidebar.slider("CPU threads", 1, 32, 16)
+    risk_aversion = st.sidebar.number_input("Risk aversion penalty", value=0.02, format="%.4f")
+    hidden_dim = st.sidebar.number_input("Policy hidden dim", min_value=16, max_value=256, value=64, step=16)
+    rl_patience = st.sidebar.number_input("Early stop patience", min_value=0, max_value=200, value=20, step=5)
+    rl_min_delta = st.sidebar.number_input("Early stop min delta", value=1e-4, format="%.5f")
+    device_choice = st.sidebar.selectbox("Device", ["cpu", "cuda"], index=0)
+    cpu_threads = st.sidebar.slider("CPU threads", 1, 32, 8)
+
     return {
         "data_source": data_source,
         "upload_mode": upload_mode,
@@ -144,19 +146,18 @@ def sidebar_controls():
         "device": device_choice,
         "cpu_threads": cpu_threads,
         "rl_mode": rl_mode,
-        "forecast_params": {
-            "stats": {"SeasonalNaive": {"season_length": sf_season}},
-            "lstm_hidden": int(lstm_hidden),
-            "lstm_layers": int(lstm_layers),
-            "lstm_proj": int(lstm_proj),
-            "lstm_seq_len": int(lstm_seq),
-            "lstm_epochs": int(lstm_epochs),
-            "lstm_lr": float(lstm_lr),
-            "lstm_patience": int(lstm_patience),
-        },
         "rl_hidden_dim": int(hidden_dim),
         "rl_patience": int(rl_patience) if rl_patience > 0 else None,
         "rl_min_delta": float(rl_min_delta),
+        "forecast_params": {
+            "stats": {"SeasonalNaive": {"season_length": int(sf_season)}},
+            "ml": {
+                "rf_params": {
+                    "n_estimators": int(rf_estimators),
+                    "max_depth": None if int(rf_max_depth) == 0 else int(rf_max_depth),
+                }
+            },
+        },
     }
 
 
@@ -171,44 +172,50 @@ def plot_prices(prices: pd.DataFrame):
     st.plotly_chart(fig, use_container_width=True)
 
 
-def plot_weights(weights_df: pd.DataFrame):
-    fig = px.bar(weights_df, x="asset", y="weight", color="asset", title="Portfolio Weights")
+def plot_weights(weights_df: pd.DataFrame, title: str):
+    fig = px.bar(weights_df, x="asset", y="weight", color="asset", title=title)
     st.plotly_chart(fig, use_container_width=True)
 
 
-def plot_correlation(prices: pd.DataFrame):
-    pivot = prices.pivot(index="ds", columns="ticker", values="close").corr()
-    fig = px.imshow(pivot, title="Ticker Correlation Heatmap", color_continuous_scale="RdBu_r")
+def plot_matrix(matrix: pd.DataFrame, title: str):
+    fig = px.imshow(matrix, title=title, color_continuous_scale="RdBu_r")
     st.plotly_chart(fig, use_container_width=True)
+
+
+def _format_alpaca_prices(raw: pd.DataFrame) -> pd.DataFrame:
+    renamed = raw.rename(columns={"timestamp": "ds", "symbol": "ticker"})
+    return format_price_frame(renamed, date_col="ds", price_col="close", ticker_col="ticker")
+
+
+def _render_metric_group(title: str, metrics: dict):
+    st.markdown(f"**{title}**")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Expected Horizon Return", f"{metrics['expected_horizon_return']:.4f}")
+    c2.metric("Expected Volatility", f"{metrics['expected_volatility']:.4f}")
+    c3.metric("Effective Assets", f"{metrics['effective_n_assets']:.2f}")
 
 
 def render_page():
-    st.title("Portfolio Optimizer (RL + Nixtla Forecasts)")
+    st.title("Portfolio Optimizer")
     st.write(
-        "Upload a CSV containing at least two years of historical prices (columns: date, ticker, close)."
-        " The RL policy should be trained offline with ~10 years of history via `portfolio_training.ipynb`."
+        "Generate validated asset-return forecasts, compare them to a deterministic mean-variance baseline, "
+        "and optionally train or reuse an RL allocator."
     )
-    st.info(
-        "For production/Streamlit Cloud, prefer the **inference mode** with a checkpoint generated locally via `portfolio_training.ipynb` using ~10 years of data."
-    )
+    st.info("CPU is the default path. RL will run on CPU when torch is installed; otherwise the baseline optimizer still works.")
 
     settings = sidebar_controls()
     resource_monitor()
-    if settings["mode"].startswith("Train"):
-        st.warning("Training mode expects a long (ideally 10-year) dataset and runs best on your local GPU.")
-    if settings["mode"].startswith("Use pre-trained") and not Path(settings["checkpoint_path"]).exists():
-        st.warning(
-            f"Checkpoint not found at {settings['checkpoint_path']}. "
-            "Train locally via portfolio_training.ipynb and place the file under models/."
-        )
 
-    if st.button("Run Optimizer"):
-        with st.spinner("Parsing uploaded data and running optimizer..."):
+    if settings["mode"].startswith("Use pre-trained") and not Path(settings["checkpoint_path"]).exists():
+        st.warning(f"Checkpoint not found at {settings['checkpoint_path']}. Inference mode will fail until a checkpoint exists.")
+
+    if st.button("Run Optimizer", type="primary"):
+        with st.spinner("Preparing data and running the optimizer..."):
             try:
                 if settings["data_source"] == "Upload CSV/Files":
                     if settings["upload_mode"] == "Single CSV (all tickers)":
                         if not settings["uploaded_single"]:
-                            st.error("Please upload a CSV containing at least two years of historical prices.")
+                            st.error("Please upload a multi-asset price CSV.")
                             return
                         df_raw = pd.read_csv(settings["uploaded_single"])
                         prices = format_price_frame(
@@ -219,7 +226,7 @@ def render_page():
                         )
                     else:
                         if not settings["uploaded_multi"]:
-                            st.error("Upload at least one ticker CSV (multi-file mode).")
+                            st.error("Upload at least one ticker CSV in multi-file mode.")
                             return
                         prices = load_prices_from_files(
                             settings["uploaded_multi"],
@@ -232,43 +239,29 @@ def render_page():
                     if not symbols:
                         st.error("Provide at least one ticker for Alpaca fetch.")
                         return
-                    # Apply Alpaca credentials if provided
-                    if settings["alpaca_api_key"] and settings["alpaca_api_secret"]:
-                        import os
-                        os.environ["ALPACA_API_KEY"] = settings["alpaca_api_key"]
-                        os.environ["ALPACA_API_SECRET"] = settings["alpaca_api_secret"]
+                    configure_alpaca_credentials(
+                        api_key=settings["alpaca_api_key"],
+                        api_secret=settings["alpaca_api_secret"],
+                        persist_env=True,
+                    )
                     if settings["data_source"] == "Fetch via Alpaca (daily)":
-                        prices = fetch_daily_bars(
-                            symbols,
-                            start=settings["alpaca_start"],
-                            end=settings["alpaca_end"],
-                        )
+                        raw = fetch_daily_bars(symbols, start=settings["alpaca_start"], end=settings["alpaca_end"])
                     else:
-                        prices = fetch_intraday_bars(
-                            symbols,
-                            start=settings["alpaca_start"],
-                            end=settings["alpaca_end"],
-                        )
-                    if prices.empty:
+                        raw = fetch_intraday_bars(symbols, start=settings["alpaca_start"], end=settings["alpaca_end"])
+                    if raw.empty:
                         st.error("No data returned from Alpaca for the requested range.")
                         return
+                    prices = _format_alpaca_prices(raw)
             except Exception as e:
-                st.error(f"Failed to parse uploaded CSV: {e}")
+                st.error(f"Failed to load price data: {e}")
                 return
 
             st.success(f"Loaded {len(prices)} rows across {prices['ticker'].nunique()} tickers.")
-            coverage_days = (prices["ds"].max() - prices["ds"].min()).days
-            if coverage_days < 365 * 2:
-                st.warning(
-                    "Data spans less than ~2 years. For best results provide at least 24 months of history."
-                )
+            coverage_days = max(1, (prices["ds"].max() - prices["ds"].min()).days)
+            if coverage_days < 365:
+                st.warning("Data spans less than ~1 year. Forecast validation and optimizer stability will be limited.")
             st.dataframe(prices.head())
             plot_prices(prices)
-            with st.expander("Correlation (upload source only)"):
-                try:
-                    plot_correlation(prices)
-                except Exception:
-                    st.write("Could not compute correlations for the uploaded data.")
 
             try:
                 if settings["mode"].startswith("Use pre-trained"):
@@ -283,23 +276,11 @@ def render_page():
                         resample_rule=settings["resample_rule"],
                         device=settings["device"],
                         rl_mode="graph" if settings["rl_mode"] == "Graph Trading" else "weights",
-                        forecast_params=settings.get("forecast_params"),
+                        forecast_params=settings["forecast_params"],
+                        cpu_threads=settings["cpu_threads"],
                     )
-                    st.success("Loaded checkpoint and ran inference.")
-                    reward_history = None
+                    st.success("Checkpoint loaded and inference completed.")
                 else:
-                    # Apply temporal split with purge/embargo before training RL
-                    try:
-                        _, _, _ = data_loading.temporal_split(
-                            prices.rename(columns={"ds": "date_tmp", "close": "close_tmp"}),  # placeholder to reuse splitter
-                            horizon=settings["horizon"],
-                            val_ratio=0.2,
-                            purge=max(1, settings["horizon"] // 2),
-                            embargo=max(1, settings["horizon"] // 4),
-                        )
-                    except Exception:
-                        # Continue even if split fails (e.g., too short), since RL code handles filtering internally
-                        pass
                     result = optimize_portfolio(
                         prices=prices,
                         horizon=settings["horizon"],
@@ -314,52 +295,70 @@ def render_page():
                         resample_rule=settings["resample_rule"],
                         device=settings["device"],
                         rl_mode="graph" if settings["rl_mode"] == "Graph Trading" else "weights",
-                        forecast_params=settings.get("forecast_params"),
-                        rl_patience=settings.get("rl_patience"),
-                        rl_min_delta=settings.get("rl_min_delta", 1e-4),
+                        forecast_params=settings["forecast_params"],
+                        rl_hidden_dim=settings["rl_hidden_dim"],
+                        cpu_threads=settings["cpu_threads"],
+                        rl_patience=settings["rl_patience"],
+                        rl_min_delta=settings["rl_min_delta"],
                     )
-                    st.success("Training completed and checkpoint saved.")
-                    reward_history = result.get("reward_history", [])
+                    st.success("Optimization completed.")
             except ImportError as e:
-                st.error(
-                    "PyTorch is required for the RL optimizer. Install GPU-enabled torch 2.9 locally. "
-                    f"Details: {e}"
-                )
+                st.error(f"RL dependencies are unavailable: {e}")
                 return
             except Exception as e:
                 st.error(f"Optimization failed: {e}")
                 return
 
-            st.subheader("Recommended Portfolio")
-            st.dataframe(result["portfolio"])
-            st.caption("Weights are normalized; expected returns derived from statsforecast AutoARIMA forecasts.")
-            plot_weights(result["portfolio"])
+            if result.get("missing_assets"):
+                st.warning(f"Missing assets in current data were zero-weighted during inference: {', '.join(result['missing_assets'])}")
+
+            st.caption(f"Optimizer engine used: `{result['optimizer_engine']}`")
+
+            st.subheader("Forecast Summary")
+            st.dataframe(
+                result["forecast_summary"][
+                    ["unique_id", "model", "expected_return", "mean_forecast_return", "forecast_volatility", "validation_rmse"]
+                ]
+            )
+
+            st.subheader("Portfolio Metrics")
+            left, right = st.columns(2)
+            with left:
+                _render_metric_group("Recommended Portfolio", result["portfolio_metrics"])
+            with right:
+                _render_metric_group("Mean-Variance Baseline", result["baseline_metrics"])
+
+            st.subheader("Portfolio Weights")
+            tab1, tab2 = st.tabs(["Recommended", "Baseline"])
+            with tab1:
+                st.dataframe(result["portfolio"])
+                plot_weights(result["portfolio"], "Recommended Portfolio Weights")
+            with tab2:
+                st.dataframe(result["baseline_portfolio"])
+                plot_weights(result["baseline_portfolio"], "Mean-Variance Baseline Weights")
+
+            if result.get("covariance_matrix") is not None:
+                st.subheader("Covariance Matrix")
+                plot_matrix(result["covariance_matrix"], "Historical Return Covariance")
 
             if result.get("top_portfolios") is not None:
-                st.subheader("Top portfolios (graph mode rollouts)")
-                tp = result["top_portfolios"]
-                tp_display = tp.copy()
-                tp_display["weights"] = tp_display["weights"].apply(lambda w: np.round(w, 3))
-                st.dataframe(tp_display)
+                st.subheader("Top Graph Rollouts")
+                top_rollouts = result["top_portfolios"].copy()
+                top_rollouts["weights"] = top_rollouts["weights"].apply(lambda w: np.round(w, 4))
+                st.dataframe(top_rollouts)
 
+            reward_history = result.get("reward_history", [])
             if reward_history:
                 st.subheader("Training Rewards")
                 plot_rewards(reward_history)
-            else:
-                st.caption("Inference mode skips RL training; rewards not shown.")
 
-            st.subheader("Projected Portfolio Return (naive expectation)")
-            expected = float(np.dot(result["portfolio"]["weight"], result["portfolio"]["expected_return"]))
-            st.metric("Expected horizon return", f"{expected:.4f}")
+            if result.get("action_log") is not None and not result["action_log"].empty:
+                st.subheader("Action Log")
+                st.dataframe(result["action_log"].head(50))
 
-            # Action / trade visualization
-            if result.get("action_log") is not None:
-                st.subheader("Action / Trade Log")
-                action_df = result["action_log"]
-                st.dataframe(action_df.head())
-                if "cum_reward" in action_df.columns:
-                    fig = px.line(action_df, x="step", y="cum_reward", title="Cumulative Reward (simulation)")
-                    st.plotly_chart(fig, use_container_width=True)
+            if result.get("checkpoint_meta"):
+                with st.expander("Checkpoint Metadata"):
+                    st.json(result["checkpoint_meta"])
 
 
 if __name__ == "__main__":

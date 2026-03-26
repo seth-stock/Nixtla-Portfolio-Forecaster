@@ -3,9 +3,9 @@ alpaca_data.py
 Utilities to fetch OHLCV bar data from Alpaca using alpaca-py for hourly, daily,
 and monthly frequencies, and to convert to Nixtla-friendly long format.
 
-Usage requires environment variables:
-  ALPACA_API_KEY
-  ALPACA_API_SECRET
+Usage requires Alpaca credentials supplied either via:
+  ALPACA_API_KEY / ALPACA_API_SECRET environment variables
+  or explicit runtime configuration through configure_alpaca_credentials()
 
 Install hint (not executed):
   pip install alpaca-py pandas
@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 import pandas as pd
 from alpaca.data.historical import StockHistoricalDataClient
@@ -30,20 +30,47 @@ def _normalize_datetime(value) -> datetime:
     return pd.to_datetime(value).to_pydatetime()
 
 
-def get_alpaca_client() -> StockHistoricalDataClient:
+def configure_alpaca_credentials(
+    api_key: Optional[str] = None,
+    api_secret: Optional[str] = None,
+    persist_env: bool = True,
+) -> Tuple[str, str]:
+    """
+    Resolve Alpaca credentials from explicit values or the environment.
+
+    This is the shared entrypoint used by the Streamlit UI and notebooks so
+    callers can either type credentials into the app or rely on pre-set env
+    vars.
+    """
+    resolved_key = (api_key or os.getenv("ALPACA_API_KEY") or "").strip()
+    resolved_secret = (api_secret or os.getenv("ALPACA_API_SECRET") or "").strip()
+    if not resolved_key or not resolved_secret:
+        raise RuntimeError(
+            "Missing Alpaca credentials. Enter an API key and secret in the app, "
+            "or set ALPACA_API_KEY and ALPACA_API_SECRET."
+        )
+    if persist_env:
+        os.environ["ALPACA_API_KEY"] = resolved_key
+        os.environ["ALPACA_API_SECRET"] = resolved_secret
+    return resolved_key, resolved_secret
+
+
+def get_alpaca_client(
+    api_key: Optional[str] = None,
+    api_secret: Optional[str] = None,
+) -> StockHistoricalDataClient:
     """
     Instantiate an Alpaca StockHistoricalDataClient using environment variables.
 
     Raises:
         RuntimeError: if ALPACA_API_KEY or ALPACA_API_SECRET are missing.
     """
-    api_key = os.getenv("ALPACA_API_KEY")
-    api_secret = os.getenv("ALPACA_API_SECRET")
-    if not api_key or not api_secret:
-        raise RuntimeError(
-            "Missing ALPACA_API_KEY or ALPACA_API_SECRET environment variables."
-        )
-    return StockHistoricalDataClient(api_key, api_secret)
+    resolved_key, resolved_secret = configure_alpaca_credentials(
+        api_key=api_key,
+        api_secret=api_secret,
+        persist_env=True,
+    )
+    return StockHistoricalDataClient(resolved_key, resolved_secret)
 
 
 def fetch_stock_bars_raw(

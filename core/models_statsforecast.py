@@ -9,15 +9,23 @@ from __future__ import annotations
 from typing import Dict, List, Tuple
 
 import pandas as pd
-from statsforecast import StatsForecast
-from statsforecast.models import AutoARIMA, AutoETS, SeasonalNaive
 
 
-MODEL_REGISTRY = {
-    "AutoARIMA": AutoARIMA,
-    "AutoETS": AutoETS,
-    "SeasonalNaive": SeasonalNaive,
-}
+def _lazy_imports():
+    try:
+        from statsforecast import StatsForecast
+        from statsforecast.models import AutoARIMA, AutoETS, SeasonalNaive
+    except Exception as e:
+        raise ImportError(
+            "statsforecast and its binary dependencies are required for classical models. "
+            f"Original error: {e}"
+        ) from e
+    model_registry = {
+        "AutoARIMA": AutoARIMA,
+        "AutoETS": AutoETS,
+        "SeasonalNaive": SeasonalNaive,
+    }
+    return StatsForecast, SeasonalNaive, model_registry
 
 
 def _prepare_data(df: pd.DataFrame, date_col: str, target_col: str) -> pd.DataFrame:
@@ -43,13 +51,15 @@ def fit_and_forecast(
     n_jobs: int | None = None,
 ) -> pd.DataFrame:
     """Fit selected statsforecast models and return forecast dataframe."""
+    StatsForecast, SeasonalNaive, model_registry = _lazy_imports()
     model_params = model_params or {}
     season_len = model_params.get("SeasonalNaive", {}).get("season_length", 1)
     sf_df = _prepare_data(df, date_col, target_col)
-    model_objs = [MODEL_REGISTRY[m](**model_params.get(m, {})) for m in models if m in MODEL_REGISTRY]
+    model_objs = [model_registry[m](**model_params.get(m, {})) for m in models if m in model_registry]
     if not model_objs:
         raise ValueError("No valid statsforecast models selected.")
-    sf = StatsForecast(models=model_objs, freq=freq, n_jobs=n_jobs or 16, fallback_model=SeasonalNaive(season_length=season_len))
+    sf_jobs = max(1, int(n_jobs)) if n_jobs is not None else 1
+    sf = StatsForecast(models=model_objs, freq=freq, n_jobs=sf_jobs, fallback_model=SeasonalNaive(season_length=season_len))
     fcst = sf.forecast(df=sf_df, h=horizon)
     fcst = fcst.reset_index(drop=True)
     fcst = fcst.melt(id_vars=["ds", "unique_id"], var_name="model", value_name="forecast")
@@ -68,10 +78,11 @@ def backtest(
     n_jobs: int | None = None,
 ) -> pd.DataFrame:
     """Run rolling-origin evaluation for selected statsforecast models."""
+    StatsForecast, SeasonalNaive, model_registry = _lazy_imports()
     model_params = model_params or {}
     season_len = model_params.get("SeasonalNaive", {}).get("season_length", 1)
     sf_df = _prepare_data(df, date_col, target_col)
-    model_objs = [MODEL_REGISTRY[m](**model_params.get(m, {})) for m in models if m in MODEL_REGISTRY]
+    model_objs = [model_registry[m](**model_params.get(m, {})) for m in models if m in model_registry]
     if not model_objs:
         return pd.DataFrame(columns=["ds", "unique_id", "cutoff", "y", "model", "forecast"])
 
@@ -88,9 +99,9 @@ def backtest(
     if sf_df_use.empty or safe_h < 1:
         return pd.DataFrame(columns=["ds", "unique_id", "cutoff", "y", "model", "forecast"])
 
-    sf = StatsForecast(models=model_objs, freq=freq, n_jobs=n_jobs or 16, fallback_model=SeasonalNaive(season_length=season_len))
-    # step_size=1 to densify in-sample predictions for plotting/backtests
-    cv = sf.cross_validation(df=sf_df_use, h=safe_h, n_windows=n_windows, step_size=1)
+    sf_jobs = max(1, int(n_jobs)) if n_jobs is not None else 1
+    sf = StatsForecast(models=model_objs, freq=freq, n_jobs=sf_jobs, fallback_model=SeasonalNaive(season_length=season_len))
+    cv = sf.cross_validation(df=sf_df_use, h=safe_h, n_windows=n_windows, step_size=safe_h)
     cv = cv.reset_index(drop=True)
     cv = cv.melt(
         id_vars=["ds", "unique_id", "cutoff", "y"],

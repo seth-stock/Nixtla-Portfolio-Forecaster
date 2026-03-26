@@ -25,6 +25,8 @@ from core.config import default_config, load_config, save_config
 
 def sidebar_controls():
     loaded_cfg = st.session_state.get("fc_loaded_cfg", {})
+    alpaca_key_default = loaded_cfg.get("alpaca_api_key", st.session_state.get("fc_alpaca_key", os.getenv("ALPACA_API_KEY", "")))
+    alpaca_secret_default = loaded_cfg.get("alpaca_api_secret", st.session_state.get("fc_alpaca_secret", os.getenv("ALPACA_API_SECRET", "")))
 
     st.sidebar.header("Data & Preprocessing")
     data_source_default = loaded_cfg.get("data_source", "Upload CSV")
@@ -40,16 +42,25 @@ def sidebar_controls():
     end_date_fetch = ""
     alpaca_api_key = ""
     alpaca_api_secret = ""
-    device_choice = st.sidebar.selectbox("Device", ["cuda", "cpu"], index=0)
-    cpu_threads = st.sidebar.slider("CPU threads (used for RF/CPU ops)", 1, 32, 16)
+    device_options = ["cpu", "cuda"]
+    device_default = loaded_cfg.get("device_choice", st.session_state.get("fc_device_choice", "cpu"))
+    cpu_default = int(loaded_cfg.get("cpu_threads", st.session_state.get("fc_cpu_threads", 8)))
+    device_choice = st.sidebar.selectbox(
+        "Device",
+        device_options,
+        index=device_options.index(device_default) if device_default in device_options else 0,
+        key="fc_device_choice",
+    )
+    cpu_threads = st.sidebar.slider("CPU threads (used for RF/CPU ops)", 1, 32, cpu_default, key="fc_cpu_threads")
     if data_source == "Upload CSV":
         uploaded = st.sidebar.file_uploader("Upload CSV", type=["csv"], key="fc_upload")
     else:
         tickers = st.sidebar.text_input("Tickers (comma-separated)", value=loaded_cfg.get("tickers", st.session_state.get("fc_tickers", "AAPL,MSFT,GOOG")), key="fc_tickers")
         start_date_fetch = st.sidebar.text_input("Start date (YYYY-MM-DD)", value=loaded_cfg.get("start_date_fetch", st.session_state.get("fc_start_fetch", "")), key="fc_start_fetch")
         end_date_fetch = st.sidebar.text_input("End date (YYYY-MM-DD)", value=loaded_cfg.get("end_date_fetch", st.session_state.get("fc_end_fetch", "")), key="fc_end_fetch")
-        alpaca_api_key = st.sidebar.text_input("Alpaca API Key", type="password", value=loaded_cfg.get("alpaca_api_key", st.session_state.get("fc_alpaca_key", "")), key="fc_alpaca_key")
-        alpaca_api_secret = st.sidebar.text_input("Alpaca API Secret", type="password", value=loaded_cfg.get("alpaca_api_secret", st.session_state.get("fc_alpaca_secret", "")), key="fc_alpaca_secret")
+        st.sidebar.caption("Enter Alpaca credentials for this session, or leave the environment defaults in place.")
+        alpaca_api_key = st.sidebar.text_input("Alpaca API Key", type="password", value=alpaca_key_default, key="fc_alpaca_key")
+        alpaca_api_secret = st.sidebar.text_input("Alpaca API Secret", type="password", value=alpaca_secret_default, key="fc_alpaca_secret")
     missing_strategy = st.sidebar.selectbox("Missing value handling", ["ffill", "bfill", "interpolate", "drop"], index=["ffill","bfill","interpolate","drop"].index(loaded_cfg.get("preprocess", {}).get("missing", st.session_state.get("fc_missing","ffill"))) if loaded_cfg.get("preprocess", {}).get("missing", None) in ["ffill","bfill","interpolate","drop"] else 0, key="fc_missing")
     start_date = st.sidebar.text_input("Filter start date (YYYY-MM-DD)", value=loaded_cfg.get("start_date", st.session_state.get("fc_start_filter", "")), key="fc_start_filter")
     end_date = st.sidebar.text_input("Filter end date (YYYY-MM-DD)", value=loaded_cfg.get("end_date", st.session_state.get("fc_end_filter", "")), key="fc_end_filter")
@@ -107,10 +118,12 @@ def sidebar_controls():
         step=10,
         key="fc_lookback_steps",
     )
+    forecast_modes = ["multi-output (direct)", "multi-step recursive", "single-step"]
+    forecast_default = loaded_cfg.get("forecast_mode", st.session_state.get("fc_forecast_mode", "multi-output (direct)"))
     forecast_mode = st.sidebar.selectbox(
         "Forecast mode",
-        ["multi-output (direct)", "multi-step recursive", "single-step"],
-        index=0,
+        forecast_modes,
+        index=forecast_modes.index(forecast_default) if forecast_default in forecast_modes else 0,
         key="fc_forecast_mode",
     )
 
@@ -351,6 +364,7 @@ def run_forecasts(df: pd.DataFrame, settings, meta_state) -> dict:
                 rf_params=params.get("ml", {}).get("rf_params"),
                 n_jobs=settings.get("cpu_threads"),
                 use_diff=params.get("ml_use_diff", True),
+                forecast_mode=settings.get("forecast_mode", "multi-output (direct)"),
             )
             results["forecast"].append(ml_fcst)
             try:
@@ -364,6 +378,7 @@ def run_forecasts(df: pd.DataFrame, settings, meta_state) -> dict:
                     rf_params=params.get("ml", {}).get("rf_params"),
                     n_jobs=settings.get("cpu_threads"),
                     use_diff=params.get("ml_use_diff", True),
+                    forecast_mode=settings.get("forecast_mode", "multi-output (direct)"),
                 )
                 if not ml_cv.empty:
                     results["cv"].append(ml_cv)
@@ -384,7 +399,12 @@ def run_forecasts(df: pd.DataFrame, settings, meta_state) -> dict:
                 settings["horizon"],
                 meta_state["freq"],
                 settings["neural_models"],
-                model_params={**params.get("neural", {}), "device_preference": settings.get("device_choice"), "context_length": settings.get("lookback_steps", 0)},
+                model_params={
+                    **params.get("neural", {}),
+                    "device_preference": settings.get("device_choice"),
+                    "cpu_threads": settings.get("cpu_threads"),
+                    "forecast_mode": settings.get("forecast_mode", "multi-output (direct)"),
+                },
             )
             results["forecast"].append(nf_fcst)
             nf_cv = models_neuralforecast.backtest(
@@ -395,7 +415,12 @@ def run_forecasts(df: pd.DataFrame, settings, meta_state) -> dict:
                 meta_state["freq"],
                 settings["neural_models"],
                 settings["n_windows"],
-                model_params={**params.get("neural", {}), "device_preference": settings.get("device_choice"), "context_length": settings.get("lookback_steps", 0)},
+                model_params={
+                    **params.get("neural", {}),
+                    "device_preference": settings.get("device_choice"),
+                    "cpu_threads": settings.get("cpu_threads"),
+                    "forecast_mode": settings.get("forecast_mode", "multi-output (direct)"),
+                },
             )
             results["cv"].append(nf_cv)
         except ImportError as e:
@@ -571,6 +596,8 @@ def render_page():
         st.session_state["fc_lookback_days"] = cfg.get("lookback_days", 0)
         st.session_state["fc_lookback_steps"] = cfg.get("lookback_steps", 0)
         st.session_state["fc_forecast_mode"] = cfg.get("forecast_mode", "multi-output (direct)")
+        st.session_state["fc_device_choice"] = cfg.get("device_choice", "cpu")
+        st.session_state["fc_cpu_threads"] = cfg.get("cpu_threads", 8)
         # Model selections
         st.session_state["fc_sf_AutoARIMA"] = "AutoARIMA" in models_cfg.get("statsforecast", [])
         st.session_state["fc_sf_AutoETS"] = "AutoETS" in models_cfg.get("statsforecast", [])
@@ -664,9 +691,11 @@ def render_page():
                         df = df[pd.to_datetime(df[date_col]) <= pd.to_datetime(settings["end_date"])]
                 else:
                     # Use already-loaded Alpaca data; basic cleaning and filtering
-                    if settings["alpaca_api_key"] and settings["alpaca_api_secret"]:
-                        os.environ["ALPACA_API_KEY"] = settings["alpaca_api_key"]
-                        os.environ["ALPACA_API_SECRET"] = settings["alpaca_api_secret"]
+                    alpaca_data.configure_alpaca_credentials(
+                        api_key=settings["alpaca_api_key"],
+                        api_secret=settings["alpaca_api_secret"],
+                        persist_env=True,
+                    )
                     symbols = [s.strip().upper() for s in settings["tickers"].split(",") if s.strip()]
                     if settings["data_source"] == "Alpaca Daily":
                         raw = alpaca_data.fetch_daily_bars(symbols, start=settings["start_date_fetch"], end=settings["end_date_fetch"])
@@ -686,11 +715,12 @@ def render_page():
                 return
 
             # Device / thread preferences
-            if settings["device_choice"] == "cpu":
+            runtime_settings = settings.copy()
+            if runtime_settings["device_choice"] == "cpu":
                 try:
-                    import torch
-                    torch.set_num_threads(settings["cpu_threads"])
                     os.environ["CUDA_VISIBLE_DEVICES"] = ""
+                    import torch
+                    torch.set_num_threads(runtime_settings["cpu_threads"])
                 except Exception:
                     pass
             else:
@@ -698,8 +728,10 @@ def render_page():
                     import torch
                     if not torch.cuda.is_available():
                         st.warning("CUDA selected but torch reports no GPU available; falling back to CPU.")
+                        runtime_settings["device_choice"] = "cpu"
                 except Exception:
                     st.warning("CUDA selected but torch failed to import; falling back to CPU.")
+                    runtime_settings["device_choice"] = "cpu"
 
             # Clean and standardize the time series (per ticker if present)
             try:
@@ -773,7 +805,7 @@ def render_page():
                     test_h = int(test_df.groupby("unique_id").size().max())
                 else:
                     test_h = len(test_df)
-                settings_with_test_h = settings.copy()
+                settings_with_test_h = runtime_settings.copy()
                 settings_with_test_h["horizon"] = test_h
                 results = run_forecasts(fit_df, settings_with_test_h, meta)
             except Exception as e:
@@ -787,6 +819,9 @@ def render_page():
                 return
 
             forecast_df = pd.concat(results["forecast"]).dropna(subset=["forecast"])
+            if forecast_df.empty:
+                st.warning("Selected models did not produce usable forecasts for the current data/window.")
+                return
             forecast_df["segment"] = "test_pred"
             forecast_df = forecast_df[forecast_df["model"].astype(str).str.lower() != "index"]
             # Align forecast horizon to actual test dates per ticker to avoid index drift

@@ -9,11 +9,20 @@ from typing import Iterable, List
 from contextlib import nullcontext
 
 import pandas as pd
-from mlforecast import MLForecast
-from mlforecast.lag_transforms import RollingMean
-from sklearn.ensemble import RandomForestRegressor
-from threadpoolctl import threadpool_limits
 import os
+
+
+def _lazy_imports():
+    try:
+        from mlforecast import MLForecast
+        from mlforecast.lag_transforms import RollingMean
+        from sklearn.ensemble import RandomForestRegressor
+    except Exception as e:
+        raise ImportError(
+            "mlforecast, scikit-learn, and their binary dependencies are required for MLForecast models. "
+            f"Original error: {e}"
+        ) from e
+    return MLForecast, RollingMean, RandomForestRegressor
 
 
 def _set_thread_env(n_jobs: int):
@@ -30,6 +39,8 @@ def _thread_context(n_jobs: int | None):
     """
     if n_jobs is None:
         return nullcontext()
+    from threadpoolctl import threadpool_limits
+
     _set_thread_env(n_jobs)
     return threadpool_limits(limits=int(max(1, n_jobs)))
 
@@ -95,8 +106,10 @@ def fit_and_forecast(
     rf_params: dict | None = None,
     n_jobs: int | None = None,
     use_diff: bool = True,
+    forecast_mode: str = "multi-output (direct)",
 ) -> pd.DataFrame:
     """Fit an MLForecast model with standard lag and rolling window features."""
+    MLForecast, RollingMean, RandomForestRegressor = _lazy_imports()
     rf_params = rf_params or {}
     # Ensure n_jobs is honored; default to provided value else all cores.
     explicit_n_jobs = n_jobs if n_jobs is not None else rf_params.pop("n_jobs", None)
@@ -116,9 +129,10 @@ def fit_and_forecast(
                 models=[regressor],
                 freq=freq,
                 lags=lag_list,
-                lag_transforms={w: [RollingMean(window_size=w)] for w in window_list},
+                lag_transforms={1: [RollingMean(window_size=w) for w in window_list]},
             )
-            ml.fit(g_reg)
+            max_horizon = horizon if forecast_mode == "multi-output (direct)" else None
+            ml.fit(g_reg, max_horizon=max_horizon)
             fcst = ml.predict(horizon)
             if "unique_id" not in fcst.columns:
                 fcst["unique_id"] = uid
@@ -150,8 +164,10 @@ def backtest(
     rf_params: dict | None = None,
     n_jobs: int | None = None,
     use_diff: bool = True,
+    forecast_mode: str = "multi-output (direct)",
 ) -> pd.DataFrame:
     """Perform rolling backtesting for MLForecast."""
+    MLForecast, RollingMean, RandomForestRegressor = _lazy_imports()
     rf_params = rf_params or {}
     explicit_n_jobs = n_jobs if n_jobs is not None else rf_params.pop("n_jobs", None)
     prepared = _prepare_data(df, date_col, target_col)
@@ -171,10 +187,17 @@ def backtest(
                 models=[regressor],
                 freq=freq,
                 lags=lag_list,
-                lag_transforms={w: [RollingMean(window_size=w)] for w in window_list},
+                lag_transforms={1: [RollingMean(window_size=w) for w in window_list]},
             )
             try:
-                cv = ml.cross_validation(h=horizon, n_windows=n_windows, step_size=1, df=g_use)
+                max_horizon = horizon if forecast_mode == "multi-output (direct)" else None
+                cv = ml.cross_validation(
+                    h=horizon,
+                    n_windows=n_windows,
+                    step_size=horizon,
+                    df=g_use,
+                    max_horizon=max_horizon,
+                )
             except ValueError:
                 continue
             if "unique_id" not in cv.columns:

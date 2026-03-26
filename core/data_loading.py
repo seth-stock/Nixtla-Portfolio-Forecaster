@@ -168,12 +168,17 @@ def _handle_missing(df: pd.DataFrame, target_col: str, strategy: MissingStrategy
     if strategy == "drop":
         return df.dropna(subset=[target_col])
     if strategy == "ffill":
-        return df.groupby("unique_id", group_keys=False).ffill() if "unique_id" in df.columns else df.ffill()
+        return df.groupby("unique_id", group_keys=False).ffill().reset_index(drop=True) if "unique_id" in df.columns else df.ffill()
     if strategy == "bfill":
-        return df.groupby("unique_id", group_keys=False).bfill() if "unique_id" in df.columns else df.bfill()
+        return df.groupby("unique_id", group_keys=False).bfill().reset_index(drop=True) if "unique_id" in df.columns else df.bfill()
     if strategy == "interpolate":
         if "unique_id" in df.columns:
-            return df.groupby("unique_id", group_keys=False).apply(lambda g: g.interpolate())
+            frames = []
+            for _, g in df.groupby("unique_id"):
+                g = g.copy()
+                g[target_col] = g[target_col].interpolate().bfill().ffill()
+                frames.append(g)
+            return pd.concat(frames, ignore_index=True)
         return df.interpolate()
     raise ValueError(f"Unknown missing data strategy: {strategy}")
 

@@ -8,12 +8,12 @@ import streamlit as st
 
 
 def main():
+    st.set_page_config(page_title="Advanced Nixtla Forecasting & RL Portfolio", layout="wide")
     # Remove practical upload limits by setting a very high max upload size (in MB).
     try:
         st.set_option("server.maxUploadSize", 5000)
     except Exception:
         pass
-    st.set_page_config(page_title="Advanced Nixtla Forecasting & RL Portfolio", layout="wide")
     st.title("Advanced Nixtla Time Series & RL Portfolio App")
     st.markdown(
         """
