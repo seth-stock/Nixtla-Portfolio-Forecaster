@@ -10,22 +10,17 @@ from typing import Dict
 import numpy as np
 import pandas as pd
 
-# Robust import: fall back to numpy-based metrics if sklearn (or its deps) fail to load.
-try:
-    from sklearn.metrics import mean_absolute_error, mean_squared_error  # type: ignore
-    _USE_SKLEARN = True
-except Exception:
-    _USE_SKLEARN = False
 
-    def mean_squared_error(y_true, y_pred):
-        y_true = np.asarray(y_true)
-        y_pred = np.asarray(y_pred)
-        return np.mean((y_true - y_pred) ** 2)
+def mean_squared_error(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    return np.mean((y_true - y_pred) ** 2)
 
-    def mean_absolute_error(y_true, y_pred):
-        y_true = np.asarray(y_true)
-        y_pred = np.asarray(y_pred)
-        return np.mean(np.abs(y_true - y_pred))
+
+def mean_absolute_error(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    return np.mean(np.abs(y_true - y_pred))
 
 
 def compute_metrics(y_true: pd.Series, y_pred: pd.Series) -> Dict[str, float]:

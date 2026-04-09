@@ -12,15 +12,40 @@ from typing import List
 import os
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
-import psutil
 
 from core import data_loading
-from core import alpaca_data
-from core import evaluation
-from core import models_mlforecast, models_neuralforecast, models_statsforecast
 from core.config import default_config, load_config, save_config
+
+
+def _get_plotly_express():
+    import plotly.express as px
+
+    return px
+
+
+def _get_psutil():
+    import psutil
+
+    return psutil
+
+
+def _get_alpaca_data():
+    from core import alpaca_data
+
+    return alpaca_data
+
+
+def _get_evaluation():
+    from core import evaluation
+
+    return evaluation
+
+
+def _get_forecast_modules():
+    from core import models_mlforecast, models_neuralforecast, models_statsforecast
+
+    return models_statsforecast, models_mlforecast, models_neuralforecast
 
 
 def sidebar_controls():
@@ -244,13 +269,14 @@ def sidebar_controls():
 
 
 def resource_monitor():
-    with st.sidebar.expander("Resource Monitor", expanded=False):
-        # Faster sampling (~30 Hz) per user request
+    if not st.sidebar.checkbox("Enable live resource monitor", value=False, key="fc_enable_resource_monitor"):
+        return
+    psutil = _get_psutil()
+    with st.sidebar.expander("Resource Monitor", expanded=True):
         cpu = psutil.cpu_percent(interval=0.03)
         mem = psutil.virtual_memory()
         st.write(f"CPU: {cpu:.1f}%")
         st.write(f"RAM: {mem.percent:.1f}% ({(mem.used/1e9):.2f} GB / {(mem.total/1e9):.2f} GB)")
-        # GPU (best effort)
         try:
             import pynvml
 
@@ -312,6 +338,7 @@ def run_forecasts(df: pd.DataFrame, settings, meta_state) -> dict:
     """Execute selected models and collect forecasts and backtests."""
     results = {"forecast": [], "cv": []}
     params = settings.get("hyperparams", {})
+    models_statsforecast, models_mlforecast, models_neuralforecast = _get_forecast_modules()
     # Derive a safe CV horizon based on available history (per series if multi-uid).
     if "unique_id" in df.columns:
         min_len = df.groupby("unique_id").size().min()
@@ -430,6 +457,7 @@ def run_forecasts(df: pd.DataFrame, settings, meta_state) -> dict:
     return results
 
 def plot_forecasts(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame, forecasts: pd.DataFrame, meta_state, cv_preds: pd.DataFrame | None = None):
+    px = _get_plotly_express()
     # Align column names
     train_l = train.rename(columns={meta_state["date_col"]: "ds", meta_state["target_col"]: "y"})
     val_l = val.rename(columns={meta_state["date_col"]: "ds", meta_state["target_col"]: "y"})
@@ -691,6 +719,7 @@ def render_page():
                         df = df[pd.to_datetime(df[date_col]) <= pd.to_datetime(settings["end_date"])]
                 else:
                     # Use already-loaded Alpaca data; basic cleaning and filtering
+                    alpaca_data = _get_alpaca_data()
                     alpaca_data.configure_alpaca_credentials(
                         api_key=settings["alpaca_api_key"],
                         api_secret=settings["alpaca_api_secret"],
@@ -840,6 +869,7 @@ def render_page():
             test_eval_df = test_df.rename(columns={date_col: "ds", target_col: "y"})
             if "unique_id" in test_df.columns:
                 test_eval_df["unique_id"] = test_df["unique_id"]
+            evaluation = _get_evaluation()
             metrics = evaluation.evaluate_holdout(test_eval_df, forecast_df)
 
             st.subheader("Evaluation - Holdout")
@@ -865,6 +895,7 @@ def render_page():
             # Top-3 models per RMSE (use backtest summary if available else holdout metrics)
             ranking_source = cv_summary if not cv_df.empty else metrics
             if ranking_source is not None and not ranking_source.empty:
+                px = _get_plotly_express()
                 if "unique_id" in ranking_source.columns:
                     top_models_map = {
                         uid: grp.sort_values("RMSE").head(3)["model"].tolist()

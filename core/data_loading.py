@@ -130,10 +130,13 @@ def temporal_split(
         if pre_test.empty:
             raise ValueError("Not enough data after applying embargo buffer.")
         val_size = max(1, int(len(pre_test) * val_ratio))
+        val_size = min(val_size, max(1, len(pre_test) - 1))
         train_local = pre_test.iloc[: -val_size].copy()
         val_local = pre_test.iloc[-val_size:].copy()
         if len(train_local) > purge:
             train_local = train_local.iloc[:-purge]
+        if train_local.empty or val_local.empty or test_local.empty:
+            raise ValueError("Not enough data remaining after validation, purge, and embargo settings.")
         return train_local, val_local, test_local
 
     if "unique_id" in df.columns:
@@ -165,21 +168,31 @@ def _read_file(file) -> pd.DataFrame:
 
 def _handle_missing(df: pd.DataFrame, target_col: str, strategy: MissingStrategy) -> pd.DataFrame:
     """Apply a missing value strategy to the target column."""
+    out = df.copy()
     if strategy == "drop":
-        return df.dropna(subset=[target_col])
+        return out.dropna(subset=[target_col])
     if strategy == "ffill":
-        return df.groupby("unique_id", group_keys=False).ffill().reset_index(drop=True) if "unique_id" in df.columns else df.ffill()
+        if "unique_id" in out.columns:
+            out[target_col] = out.groupby("unique_id")[target_col].ffill()
+            return out
+        out[target_col] = out[target_col].ffill()
+        return out
     if strategy == "bfill":
-        return df.groupby("unique_id", group_keys=False).bfill().reset_index(drop=True) if "unique_id" in df.columns else df.bfill()
+        if "unique_id" in out.columns:
+            out[target_col] = out.groupby("unique_id")[target_col].bfill()
+            return out
+        out[target_col] = out[target_col].bfill()
+        return out
     if strategy == "interpolate":
-        if "unique_id" in df.columns:
+        if "unique_id" in out.columns:
             frames = []
-            for _, g in df.groupby("unique_id"):
+            for _, g in out.groupby("unique_id"):
                 g = g.copy()
                 g[target_col] = g[target_col].interpolate().bfill().ffill()
                 frames.append(g)
             return pd.concat(frames, ignore_index=True)
-        return df.interpolate()
+        out[target_col] = out[target_col].interpolate().bfill().ffill()
+        return out
     raise ValueError(f"Unknown missing data strategy: {strategy}")
 
 
@@ -219,7 +232,11 @@ def prepare_multiseries_frame(
         raise ValueError(f"Missing required column(s): {missing_cols}")
 
     # Keep only the necessary columns to avoid plotting/model surprises.
-    keep_cols = [date_col, target_col] + (["ticker"] if has_ticker else [])
+    keep_cols = [date_col, target_col]
+    if has_ticker:
+        keep_cols.append("ticker")
+    elif "unique_id" in frame.columns:
+        keep_cols.append("unique_id")
     frame = frame[keep_cols].copy()
     # If a ticker column exists but was not retained (e.g., misnamed), attempt to keep it.
     if "ticker" not in frame.columns and has_ticker and detected_ticker and detected_ticker in df.columns:

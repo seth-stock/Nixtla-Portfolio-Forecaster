@@ -1,2 +1,12 @@
 __pycache__/
 *.py[cod]
+lightning_logs/
+.ipynb_checkpoints/
+logs/
+logs.log
+webapp/frontend/.next/
+webapp/frontend/node_modules/
+webapp/frontend/out/
+webapp/desktop/logs/
+webapp/desktop/build/
+webapp/desktop/dist/

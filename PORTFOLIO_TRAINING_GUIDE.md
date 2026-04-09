@@ -1,4 +1,4 @@
-# Portfolio Training Guide
+﻿# Portfolio Training Guide
 
 This guide covers how to train the portfolio optimizer checkpoints from `portfolio_training.ipynb`.
 
@@ -7,7 +7,7 @@ This guide covers how to train the portfolio optimizer checkpoints from `portfol
 Open Anaconda Prompt and run:
 
 ```bash
-conda activate datascience312
+conda activate forecastapp
 cd /d C:\Nixtla-Portfolio-Forecaster
 pip install -r requirements.txt
 jupyter lab
@@ -95,19 +95,19 @@ The notebook writes:
 - model checkpoints into `models/`
 - a training summary into `data/training_runs/portfolio_training_summary.csv`
 
-Each training job also runs an inference round-trip immediately after saving the checkpoint. That verifies the checkpoint can be reloaded by the app.
+Each training job also runs an inference round-trip immediately after saving the checkpoint. That verifies the checkpoint can be reloaded by the application.
 
-## 6. Use the Checkpoints in Streamlit
+## 6. Use the Checkpoints in the App
 
-Start the app:
+Start the desktop app:
 
 ```bash
-streamlit run app.py
+python app.py
 ```
 
-Then open the Portfolio Optimizer page and:
+Then open the Portfolio Optimizer screen and:
 
-- choose `Use pre-trained checkpoint (inference)`
+- choose inference mode
 - point `Checkpoint path` at one of the saved `.pt` files
 - choose `Continuous Weights` for normal `.pt` checkpoints
 - choose `Graph Trading` for `_graph.pt` checkpoints

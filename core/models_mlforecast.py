@@ -1,4 +1,4 @@
-"""
+﻿"""
 models_mlforecast.py
 MLForecast wrapper leveraging tree-based regressors with lag/rolling features.
 """
@@ -35,7 +35,7 @@ def _set_thread_env(n_jobs: int):
 def _thread_context(n_jobs: int | None):
     """
     Create a context manager that constrains thread usage for BLAS/OpenMP-heavy ops.
-    Ensures the Streamlit slider truly caps CPU usage during RF training/backtests.
+    Ensures the configured CPU thread limit is respected during RF training/backtests.
     """
     if n_jobs is None:
         return nullcontext()
@@ -224,3 +224,4 @@ def backtest(
     if not cv_results:
         return pd.DataFrame(columns=["ds", "unique_id", "cutoff", "model", "forecast", "y"])
     return pd.concat(cv_results, ignore_index=True)
+

@@ -1,4 +1,4 @@
-"""
+﻿"""
 alpaca_data.py
 Utilities to fetch OHLCV bar data from Alpaca using alpaca-py for hourly, daily,
 and monthly frequencies, and to convert to Nixtla-friendly long format.
@@ -18,9 +18,19 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Literal, Optional, Tuple
 
 import pandas as pd
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+
+def _lazy_imports():
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+    except Exception as e:
+        raise ImportError(
+            "alpaca-py is required for Alpaca data loading. "
+            f"Original error: {e}"
+        ) from e
+    return StockHistoricalDataClient, StockBarsRequest, TimeFrame, TimeFrameUnit
 
 
 def _normalize_datetime(value) -> datetime:
@@ -38,7 +48,7 @@ def configure_alpaca_credentials(
     """
     Resolve Alpaca credentials from explicit values or the environment.
 
-    This is the shared entrypoint used by the Streamlit UI and notebooks so
+    This is the shared entrypoint used by the desktop app, API layer, and notebooks so
     callers can either type credentials into the app or rely on pre-set env
     vars.
     """
@@ -58,7 +68,7 @@ def configure_alpaca_credentials(
 def get_alpaca_client(
     api_key: Optional[str] = None,
     api_secret: Optional[str] = None,
-) -> StockHistoricalDataClient:
+):
     """
     Instantiate an Alpaca StockHistoricalDataClient using environment variables.
 
@@ -70,13 +80,14 @@ def get_alpaca_client(
         api_secret=api_secret,
         persist_env=True,
     )
+    StockHistoricalDataClient, _, _, _ = _lazy_imports()
     return StockHistoricalDataClient(resolved_key, resolved_secret)
 
 
 def fetch_stock_bars_raw(
-    client: StockHistoricalDataClient,
+    client,
     symbols: List[str],
-    timeframe: TimeFrame,
+    timeframe,
     start,
     end,
     feed: str = "sip",
@@ -99,6 +110,7 @@ def fetch_stock_bars_raw(
         ValueError: if symbols list is empty or start >= end.
         Alpaca exceptions propagate on API errors.
     """
+    _, StockBarsRequest, _, _ = _lazy_imports()
     if not symbols:
         raise ValueError("symbols must be a non-empty list of tickers")
     start_dt = _normalize_datetime(start)
@@ -127,12 +139,14 @@ def fetch_stock_bars_raw(
 
 def fetch_hourly_bars(symbols: List[str], start, end, feed: str = "sip") -> pd.DataFrame:
     """Fetch hourly OHLCV bars for symbols between start and end."""
+    _, _, TimeFrame, _ = _lazy_imports()
     client = get_alpaca_client()
     return fetch_stock_bars_raw(client, symbols, TimeFrame.Hour, start, end, feed=feed)
 
 
 def fetch_daily_bars(symbols: List[str], start, end, feed: str = "sip") -> pd.DataFrame:
     """Fetch daily OHLCV bars for symbols between start and end."""
+    _, _, TimeFrame, _ = _lazy_imports()
     client = get_alpaca_client()
     return fetch_stock_bars_raw(client, symbols, TimeFrame.Day, start, end, feed=feed)
 
@@ -142,6 +156,7 @@ def fetch_intraday_bars(symbols: List[str], start, end, minutes: int = 1, feed: 
     Fetch intraday OHLCV bars for symbols with a given minute interval.
     minutes can be 1, 5, 10, etc. depending on Alpaca allowances.
     """
+    _, _, TimeFrame, TimeFrameUnit = _lazy_imports()
     client = get_alpaca_client()
     tf = TimeFrame(amount=minutes, unit=TimeFrameUnit.Minute)
     return fetch_stock_bars_raw(client, symbols, tf, start, end, feed=feed)
@@ -216,3 +231,4 @@ if __name__ == "__main__":
     print("Nixtla long example (daily, close -> y):")
     nixtla_daily = to_nixtla_long(daily)
     print(nixtla_daily.head())
+

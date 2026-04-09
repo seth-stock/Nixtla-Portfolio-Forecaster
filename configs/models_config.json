@@ -10,11 +10,7 @@
     "mlforecast": [
       "RandomForest"
     ],
-    "neuralforecast": [
-      "RNN",
-      "LSTM",
-      "S5"
-    ]
+    "neuralforecast": []
   },
   "preprocess": {
     "missing": "ffill"

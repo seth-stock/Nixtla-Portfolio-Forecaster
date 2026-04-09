@@ -38,7 +38,7 @@ def default_config() -> Dict[str, Any]:
         "models": {
             "statsforecast": ["AutoARIMA", "AutoETS"],
             "mlforecast": ["RandomForest"],
-            "neuralforecast": ["RNN"],
+            "neuralforecast": [],
         },
         "backtest": {"windows": 2},
     }

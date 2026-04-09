@@ -1096,7 +1096,16 @@ def optimize_portfolio_inference(
     if missing_assets:
         mask = np.array([asset not in missing_assets for asset in trained_assets], dtype=float)
         weights = weights * mask
-        weights = weights / weights.sum() if weights.sum() > 0 else baseline_weights
+        if weights.sum() > 0:
+            weights = weights / weights.sum()
+        else:
+            fallback_weights = baseline_weights * mask
+            if fallback_weights.sum() > 0:
+                weights = fallback_weights / fallback_weights.sum()
+            elif mask.sum() > 0:
+                weights = mask / mask.sum()
+            else:
+                weights = baseline_weights
 
     portfolio = _assemble_portfolio_frame(trained_assets, weights, selected_forecasts)
     portfolio_metrics = summarize_portfolio_metrics(

@@ -12,25 +12,47 @@ from typing import List
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import streamlit as st
-import psutil
 
-from core.alpaca_data import (
-    configure_alpaca_credentials,
-    fetch_daily_bars,
-    fetch_intraday_bars,
-)
-from core.portfolio_rl import (
-    format_price_frame,
-    load_prices_from_files,
-    optimize_portfolio,
-    optimize_portfolio_inference,
-)
+
+def _get_plotly_express():
+    import plotly.express as px
+
+    return px
+
+
+def _get_psutil():
+    import psutil
+
+    return psutil
+
+
+def _get_alpaca_helpers():
+    from core.alpaca_data import (
+        configure_alpaca_credentials,
+        fetch_daily_bars,
+        fetch_intraday_bars,
+    )
+
+    return configure_alpaca_credentials, fetch_daily_bars, fetch_intraday_bars
+
+
+def _get_portfolio_helpers():
+    from core.portfolio_rl import (
+        format_price_frame,
+        load_prices_from_files,
+        optimize_portfolio,
+        optimize_portfolio_inference,
+    )
+
+    return format_price_frame, load_prices_from_files, optimize_portfolio, optimize_portfolio_inference
 
 
 def resource_monitor():
-    with st.sidebar.expander("Resource Monitor", expanded=False):
+    if not st.sidebar.checkbox("Enable live resource monitor", value=False, key="po_enable_resource_monitor"):
+        return
+    psutil = _get_psutil()
+    with st.sidebar.expander("Resource Monitor", expanded=True):
         cpu = psutil.cpu_percent(interval=0.1)
         mem = psutil.virtual_memory()
         st.write(f"CPU: {cpu:.1f}%")
@@ -162,27 +184,32 @@ def sidebar_controls():
 
 
 def plot_rewards(rewards: List[float]):
+    px = _get_plotly_express()
     df = pd.DataFrame({"episode": range(1, len(rewards) + 1), "reward": rewards})
     fig = px.line(df, x="episode", y="reward", title="RL Training Reward per Episode")
     st.plotly_chart(fig, use_container_width=True)
 
 
 def plot_prices(prices: pd.DataFrame):
+    px = _get_plotly_express()
     fig = px.line(prices, x="ds", y="close", color="ticker", title="Historical Prices")
     st.plotly_chart(fig, use_container_width=True)
 
 
 def plot_weights(weights_df: pd.DataFrame, title: str):
+    px = _get_plotly_express()
     fig = px.bar(weights_df, x="asset", y="weight", color="asset", title=title)
     st.plotly_chart(fig, use_container_width=True)
 
 
 def plot_matrix(matrix: pd.DataFrame, title: str):
+    px = _get_plotly_express()
     fig = px.imshow(matrix, title=title, color_continuous_scale="RdBu_r")
     st.plotly_chart(fig, use_container_width=True)
 
 
 def _format_alpaca_prices(raw: pd.DataFrame) -> pd.DataFrame:
+    format_price_frame, _, _, _ = _get_portfolio_helpers()
     renamed = raw.rename(columns={"timestamp": "ds", "symbol": "ticker"})
     return format_price_frame(renamed, date_col="ds", price_col="close", ticker_col="ticker")
 
@@ -212,6 +239,7 @@ def render_page():
     if st.button("Run Optimizer", type="primary"):
         with st.spinner("Preparing data and running the optimizer..."):
             try:
+                format_price_frame, load_prices_from_files, optimize_portfolio, optimize_portfolio_inference = _get_portfolio_helpers()
                 if settings["data_source"] == "Upload CSV/Files":
                     if settings["upload_mode"] == "Single CSV (all tickers)":
                         if not settings["uploaded_single"]:
@@ -239,6 +267,7 @@ def render_page():
                     if not symbols:
                         st.error("Provide at least one ticker for Alpaca fetch.")
                         return
+                    configure_alpaca_credentials, fetch_daily_bars, fetch_intraday_bars = _get_alpaca_helpers()
                     configure_alpaca_credentials(
                         api_key=settings["alpaca_api_key"],
                         api_secret=settings["alpaca_api_secret"],
